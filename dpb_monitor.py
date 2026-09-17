@@ -26,11 +26,23 @@ import numpy as np
 # ============================================================
 CONFIG_FILE = Path(__file__).parent / "dpb_config.json"
 
+# 目标时区：Twelve Data 默认返回 UTC+10，通过 API 的 timezone 参数显式指定为目标时区
+TZ_NAME = "Asia/Shanghai"  # UTC+8 北京时间
+
+# 配置缓存：避免每次请求/节流都重新读盘+解析 JSON（原来是每请求读一次）
+_config_cache = {"mtime": 0.0, "data": None}
+
 def load_config():
-    """加载配置，不存在则创建默认"""
+    """加载配置（带 mtime 缓存），不存在则创建默认"""
     if CONFIG_FILE.exists():
+        mtime = CONFIG_FILE.stat().st_mtime
+        if _config_cache["data"] is not None and _config_cache["mtime"] == mtime:
+            return _config_cache["data"]
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
+        _config_cache["mtime"] = mtime
+        _config_cache["data"] = cfg
+        return cfg
     
     default = {
         "wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY_HERE",
@@ -61,6 +73,7 @@ def load_config():
         "risk2": 3.0,
         "check_interval_minutes": 5,
         "state_file": str(Path(__file__).parent / "dpb_state.json"),
+        "timezone": TZ_NAME,
         # 新增参数
         "use_volume_filter": True,
         "vol_ratio": 0.8,
@@ -210,7 +223,8 @@ def fetch_data(ticker: str, period: str, interval: str, retries: int = 3) -> pd.
                 "symbol": ticker,
                 "interval": interval,
                 "outputsize": 1000,
-                "apikey": key
+                "apikey": key,
+                "timezone": cfg.get("timezone", TZ_NAME),  # 显式时区，避免默认 UTC+10
             }
             resp = _session.get(
                 "https://api.twelvedata.com/time_series",
@@ -264,7 +278,7 @@ def fetch_data(ticker: str, period: str, interval: str, retries: int = 3) -> pd.
                 "close": "Close",
                 "volume": "Volume"
             })
-            df["Date"] = pd.to_datetime(df["Date"])
+            df["Date"] = pd.to_datetime(df["Date"])  # 已是目标时区（API 显式指定 timezone）
             df = df.set_index("Date")
             df = df.sort_index()
             
@@ -750,47 +764,42 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 # 企业微信推送
 # ============================================================
 def send_wecom(webhook: str, title: str, content: str):
-    """发送企业微信机器人消息"""
+    """发送企业微信机器人消息（复用连接 + 异常防护，避免推送失败拖垮整轮检查）"""
     payload = {
         "msgtype": "markdown",
         "markdown": {
             "content": f"## {title}\n{content}"
         }
     }
-    resp = requests.post(webhook, json=payload, timeout=10)
-    result = resp.json()
+    try:
+        resp = _session.post(webhook, json=payload, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        log.error(f"[推送] 异常: {e}")
+        return
     if result.get("errcode") == 0:
         log.info(f"[推送] 成功: {title}")
     else:
         log.error(f"[推送] 失败: {result}")
 
 
-def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict) -> tuple:
-    """格式化信号消息，返回 (title, content) 方便标题也精简"""
-    close = row["Close"]
+def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
+    """统一计算止损/止盈，返回 (entry, sl, r_size, r1, r2, tp1, tp2)。
+    原逻辑在 format_signal_msg 与 check_signals 中重复，抽成单一来源避免漂移。"""
+    entry = row["Close"]
     ema70 = row["ema70"]
     atr = row["atr"]
-    
-    # 止损计算（考虑回踩极值和ATR安全垫）
     sl_cushion = cfg.get("sl_cushion", 0.3)
     pullback_extreme = row.get("signal_pullback_extreme", np.nan)
-    
-    if signal > 0:
-        entry = close
-        if not np.isnan(pullback_extreme):
-            sl = max(ema70, pullback_extreme - atr * sl_cushion)
-        else:
-            sl = ema70
+
+    if sig > 0:
+        sl = max(ema70, pullback_extreme - atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
         r_size = max(abs(entry - sl), atr * 0.1)
     else:
-        entry = close
-        if not np.isnan(pullback_extreme):
-            sl = min(ema70, pullback_extreme + atr * sl_cushion)
-        else:
-            sl = ema70
+        sl = min(ema70, pullback_extreme + atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
         r_size = max(abs(sl - entry), atr * 0.1)
-    
-    # 周期风格
+
     tf_min_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
     tf_min = tf_min_map.get(tf, 60)
     if tf_min <= 15:
@@ -801,10 +810,16 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict) -> tuple:
         r1, r2 = 2.0, 4.0
     else:
         r1, r2 = 3.0, 6.0
-    
-    tp1 = entry + (r_size if signal > 0 else -r_size) * r1
-    tp2 = entry + (r_size if signal > 0 else -r_size) * r2
-    
+
+    tp1 = entry + (r_size if sig > 0 else -r_size) * r1
+    tp2 = entry + (r_size if sig > 0 else -r_size) * r2
+    return entry, sl, r_size, r1, r2, tp1, tp2
+
+
+def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict) -> tuple:
+    """格式化信号消息，返回 (title, content) 方便标题也精简"""
+    entry, sl, _r_size, r1, r2, tp1, tp2 = calc_sl_tp(signal, row, cfg, tf)
+
     # 方向标签
     d = "多" if signal > 0 else "空"
     sig_type = row.get("signal_type", "")
@@ -844,15 +859,22 @@ def _state_path(state_file: str) -> Path:
 def load_state(state_file: str) -> dict:
     p = _state_path(state_file)
     if p.exists():
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log.error(f"[状态] 状态文件损坏，已重置: {e}")
+            return {}
     return {}
 
 
 def save_state(state_file: str, state: dict):
     p = _state_path(state_file)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        log.error(f"[状态] 保存失败: {e}")
 
 
 # ============================================================
@@ -890,34 +912,10 @@ def check_signals(cfg: dict, state: dict) -> dict:
                 band = last.get("signal_band", "")
                 band_tag = f"({band})" if band else ""
                 
-                # 计算止损和TP
-                sl_cushion = cfg.get("sl_cushion", 0.3)
-                pullback_extreme = last.get("signal_pullback_extreme", np.nan)
-                entry = last["Close"]
-                ema70 = last["ema70"]
+                # 计算止损和TP（统一走 calc_sl_tp，与 format_signal_msg 同源）
+                entry, sl, r_size, r1, r2, tp1, tp2 = calc_sl_tp(sig, last, cfg, tf)
                 atr = last["atr"]
-                
-                if sig > 0:
-                    sl = max(ema70, pullback_extreme - atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
-                    r_size = max(abs(entry - sl), atr * 0.1)
-                else:
-                    sl = min(ema70, pullback_extreme + atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
-                    r_size = max(abs(sl - entry), atr * 0.1)
-                
-                tf_min_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
-                tf_min = tf_min_map.get(tf, 60)
-                if tf_min <= 15:
-                    r1, r2 = 1.0, 2.0
-                elif tf_min <= 60:
-                    r1, r2 = 1.5, 3.0
-                elif tf_min <= 240:
-                    r1, r2 = 2.0, 4.0
-                else:
-                    r1, r2 = 3.0, 6.0
-                
-                tp1 = entry + (r_size if sig > 0 else -r_size) * r1
-                tp2 = entry + (r_size if sig > 0 else -r_size) * r2
-                
+
                 vol_status = "量✓" if last.get("vol_pass", True) else "量✗"
                 trend_status = "多" if last["is_uptrend"] else "空" if last["is_downtrend"] else "震荡"
                 

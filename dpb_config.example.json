@@ -54,5 +54,6 @@
   "pullback_confirm_bars": 3,
   "sl_cushion": 0.3,
   "use_trend_cooldown": true,
-  "trend_cooldown_bars": 5
+  "trend_cooldown_bars": 5,
+  "timezone": "Asia/Shanghai"
 }
