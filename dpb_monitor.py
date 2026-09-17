@@ -67,6 +67,7 @@ def load_config():
         "signal_cooldown": 10,
         "breakout_tolerance": 5,
         "min_signal_grade": "C",   # 最低推送等级(S/A/B/C)，治理信号过频
+        "resonance_min_count": 2,  # 多少个周期同向才算多周期共振
         "rsi_len": 14,
         "rsi_long_min": 40,
         "rsi_short_max": 60,
@@ -911,32 +912,38 @@ def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
     return entry, sl, r_size, r1, r2, tp1, tp2
 
 
-def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict) -> tuple:
-    """格式化信号消息，返回 (title, content) 方便标题也精简"""
+def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance_tfs=None) -> tuple:
+    """格式化信号消息，返回 (title, content)。
+    resonance_tfs: 同向共振的周期列表；>=2 时加 🔥 共振标记。"""
     entry, sl, _r_size, r1, r2, tp1, tp2 = calc_sl_tp(signal, row, cfg, tf)
 
     # 方向标签
     d = "多" if signal > 0 else "空"
     sig_type = row.get("signal_type", "")
     grade = row.get("signal_grade", "")
-    
+    resonance = bool(resonance_tfs) and len(resonance_tfs) >= 2
+
     # 标题：一眼看到方向+周期+价格（手机通知预览可见）
     title = f"{'🟢' if signal > 0 else '🔴'}{d} {tf} {entry:.2f}"
     if sig_type:
         title += f"[{sig_type}]"
     if grade:
         title += f"[{grade}]"
+    if resonance:
+        title = "🔥" + title
     title += f" SL:{sl:.2f} TP1:{tp1:.2f}"
-    
-    # 内容：补充TP2和时间
+
+    # 内容：补充TP2与共振信息
     content = (
         f"> 入场: **{entry:.2f}**\n"
         f"> 止损: **{sl:.2f}**\n"
         f"> TP1: **{tp1:.2f}**\n"
         f"> TP2: **{tp2:.2f}**\n"
-        f"> {row.name.strftime('%H:%M')}"
     )
-    
+    if resonance:
+        content += f"> 🔥 **多周期共振**({len(resonance_tfs)}个): {', '.join(resonance_tfs)}\n"
+    content += f"> {row.name.strftime('%H:%M')}"
+
     return title, content
 
 
@@ -976,65 +983,87 @@ def save_state(state_file: str, state: dict):
 # 主循环
 # ============================================================
 def check_signals(cfg: dict, state: dict) -> dict:
-    """检查所有周期的信号，返回更新后的状态"""
+    """检查所有周期的信号，返回更新后的状态。
+
+    A4 改造：先算完所有周期，再按「同向周期数」判定多周期共振，
+    推送时带 🔥 标记，帮助区分"单周期噪音"与"多周期共振"信号。
+    """
     ticker = cfg.get("ticker_td", cfg.get("ticker_av", cfg["ticker"]))
-    
-    for idx, (tf, params) in enumerate(cfg["timeframes"].items()):
+    min_grade = cfg.get("min_signal_grade", "C")
+    resonance_min = cfg.get("resonance_min_count", 2)
+
+    # ---- 阶段 1：抓取并计算所有周期 ----
+    results = {}  # tf -> (sig, last_row)
+    for tf, params in cfg["timeframes"].items():
         try:
-            # 实时抓取：每次循环都拉最新行情
             df = fetch_data(ticker, tf, params["interval"])
             df = calc_signals(df, cfg)
-            
-            # 取最后一根K线
             last = df.iloc[-1]
-            sig = int(last["signal"])
+            results[tf] = (int(last["signal"]), last)
+        except Exception as e:
+            log.error(f"[错误] {tf} 检查失败: {e}")
+
+    # ---- 阶段 2：统计各方向信号所属周期（用于共振判定）----
+    long_tfs = [tf for tf, (s, _) in results.items() if s == 1]
+    short_tfs = [tf for tf, (s, _) in results.items() if s == -1]
+    if long_tfs or short_tfs:
+        log.info(f"[共振] 同向周期 — 多: {long_tfs or '无'} | 空: {short_tfs or '无'}")
+
+    # ---- 阶段 3：逐周期推送 ----
+    for tf, (sig, last) in results.items():
+        try:
+            if sig == 0:
+                continue
 
             # A5 信号等级门槛：低于 min_signal_grade 的信号不推送（治理信号过频）
-            min_grade = cfg.get("min_signal_grade", "C")
             grade_now = last.get("signal_grade", "")
-            if sig != 0 and _GRADE_ORDER.get(grade_now, 0) < _GRADE_ORDER.get(min_grade, 0):
+            if _GRADE_ORDER.get(grade_now, 0) < _GRADE_ORDER.get(min_grade, 0):
                 log.info(f"[过滤] {tf} {grade_now}级 低于门槛 {min_grade} → 跳过推送")
                 continue
 
             # 去重：同一周期同一方向不重复推送
             key = f"{tf}_{sig}"
-            if sig != 0 and state.get(key) != last.name.isoformat():
-                title, content = format_signal_msg(tf, sig, last, cfg)
-                send_wecom(cfg["wecom_webhook"], title, content)
-                state[key] = last.name.isoformat()
-                log.info(f"[信号] {title} @ {last['Close']:.2f}")
-                
-                # 记录到信号专用日志（详细版）
-                direction = "买入" if sig > 0 else "卖出"
-                sig_type = last.get("signal_type", "")
-                type_tag = f"[{sig_type}]" if sig_type else ""
-                grade = last.get("signal_grade", "")
-                score = last.get("signal_score", 0)
-                grade_tag = f"[{grade}级{score}/8]" if grade else ""
-                band = last.get("signal_band", "")
-                band_tag = f"({band})" if band else ""
-                
-                # 计算止损和TP（统一走 calc_sl_tp，与 format_signal_msg 同源）
-                entry, sl, r_size, r1, r2, tp1, tp2 = calc_sl_tp(sig, last, cfg, tf)
-                atr = last["atr"]
-
-                vol_status = "量✓" if last.get("vol_pass", True) else "量✗"
-                trend_status = "多" if last["is_uptrend"] else "空" if last["is_downtrend"] else "震荡"
-                
-                signal_log.info(
-                    f"{tf} {direction}{type_tag}{grade_tag}{band_tag} | "
-                    f"入:{entry:.2f} | SL:{sl:.2f}(R{r_size:.2f}) | "
-                    f"TP1:{tp1:.2f}({r1}R) TP2:{tp2:.2f}({r2}R) | "
-                    f"RSI:{last['rsi']:.1f} ATR:{atr:.2f} {vol_status} | "
-                    f"趋势:{trend_status}"
-                )
-            elif sig != 0:
+            if state.get(key) == last.name.isoformat():
                 log.info(f"[信号] {tf} 已有推送，跳过")
-            # 无信号时不记录日志
-                
+                continue
+
+            # 共振判定：同向周期数 >= 阈值
+            same_tfs = long_tfs if sig > 0 else short_tfs
+            res_tfs = same_tfs if len(same_tfs) >= resonance_min else None
+
+            title, content = format_signal_msg(tf, sig, last, cfg, resonance_tfs=res_tfs)
+            send_wecom(cfg["wecom_webhook"], title, content)
+            state[key] = last.name.isoformat()
+            log.info(f"[信号] {title} @ {last['Close']:.2f}")
+
+            # 记录到信号专用日志（详细版）
+            direction = "买入" if sig > 0 else "卖出"
+            sig_type = last.get("signal_type", "")
+            type_tag = f"[{sig_type}]" if sig_type else ""
+            grade = last.get("signal_grade", "")
+            score = last.get("signal_score", 0)
+            grade_tag = f"[{grade}级{score}/8]" if grade else ""
+            band = last.get("signal_band", "")
+            band_tag = f"({band})" if band else ""
+            res_tag = f" 🔥共振{len(res_tfs)}" if res_tfs else ""
+
+            # 计算止损和TP（统一走 calc_sl_tp，与 format_signal_msg 同源）
+            entry, sl, r_size, r1, r2, tp1, tp2 = calc_sl_tp(sig, last, cfg, tf)
+            atr = last["atr"]
+
+            vol_status = "量✓" if last.get("vol_pass", True) else "量✗"
+            trend_status = "多" if last["is_uptrend"] else "空" if last["is_downtrend"] else "震荡"
+
+            signal_log.info(
+                f"{tf} {direction}{type_tag}{grade_tag}{band_tag}{res_tag} | "
+                f"入:{entry:.2f} | SL:{sl:.2f}(R{r_size:.2f}) | "
+                f"TP1:{tp1:.2f}({r1}R) TP2:{tp2:.2f}({r2}R) | "
+                f"RSI:{last['rsi']:.1f} ATR:{atr:.2f} {vol_status} | "
+                f"趋势:{trend_status}"
+            )
         except Exception as e:
-            log.error(f"[错误] {tf} 检查失败: {e}")
-    
+            log.error(f"[错误] {tf} 推送失败: {e}")
+
     return state
 
 
