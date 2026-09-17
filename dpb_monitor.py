@@ -78,6 +78,7 @@ def load_config():
         "check_interval_minutes": 5,
         "state_file": str(Path(__file__).parent / "dpb_state.json"),
         "db_file": "signals.db",   # B8 信号持久化数据库
+        "status_file": "dpb_status.json",  # B9 Web 仪表盘状态快照
         "timezone": TZ_NAME,
         # 新增参数
         "use_volume_filter": True,
@@ -1071,6 +1072,38 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_
 
 
 # ============================================================
+# B9 状态快照（供 Web 仪表盘读取，避免仪表盘重复消耗 API 配额）
+# ============================================================
+def _write_status(cfg: dict, results: dict):
+    """把各周期最新状态写入 JSON 快照"""
+    try:
+        snap = {
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ticker": cfg.get("ticker_td", cfg.get("ticker")),
+            "timeframes": {},
+        }
+        for tf, (sig, last) in results.items():
+            snap["timeframes"][tf] = {
+                "signal": int(sig),
+                "bar_time": last.name.strftime("%Y-%m-%d %H:%M"),
+                "close": round(float(last["Close"]), 2),
+                "rsi": round(float(last["rsi"]), 1),
+                "atr": round(float(last["atr"]), 2),
+                "trend": "多" if last["is_uptrend"] else "空" if last["is_downtrend"] else "震荡",
+                "grade": last.get("signal_grade", ""),
+                "score": int(last.get("signal_score", 0) or 0),
+                "type": last.get("signal_type", ""),
+                "band": last.get("signal_band", ""),
+                "vol_ok": bool(last.get("vol_pass", True)),
+            }
+        p = _state_path(cfg.get("status_file", "dpb_status.json"))
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"[状态快照] 写入失败: {e}")
+
+
+# ============================================================
 # 主循环
 # ============================================================
 def check_signals(cfg: dict, state: dict) -> dict:
@@ -1099,6 +1132,9 @@ def check_signals(cfg: dict, state: dict) -> dict:
     short_tfs = [tf for tf, (s, _) in results.items() if s == -1]
     if long_tfs or short_tfs:
         log.info(f"[共振] 同向周期 — 多: {long_tfs or '无'} | 空: {short_tfs or '无'}")
+
+    # B9 写状态快照（供 Web 仪表盘读取，零 API 消耗）
+    _write_status(cfg, results)
 
     # ---- 阶段 3：逐周期推送 ----
     for tf, (sig, last) in results.items():

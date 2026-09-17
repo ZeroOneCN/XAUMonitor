@@ -6,6 +6,9 @@ dpb_state.json
 signals.db
 *.db
 
+# 状态快照（B9 仪表盘）
+dpb_status.json
+
 # 运行日志
 dpb_signals.log
 dpb_signals.txt
