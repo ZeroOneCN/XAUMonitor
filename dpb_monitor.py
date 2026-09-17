@@ -83,6 +83,7 @@ def load_config():
         "use_pullback_confirm": True,
         "pullback_confirm_bars": 3,
         "sl_cushion": 0.3,
+        "breakout_sl_atr": 1.5,   # 突破模式固定 ATR 止损倍数
         "use_trend_cooldown": True,
         "trend_cooldown_bars": 5,
     }
@@ -876,8 +877,14 @@ def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
     atr = row["atr"]
     sl_cushion = cfg.get("sl_cushion", 0.3)
     pullback_extreme = row.get("signal_pullback_extreme", np.nan)
+    sig_type = row.get("signal_type", "")
+    bo_sl_atr = cfg.get("breakout_sl_atr", 1.5)
 
-    if sig > 0:
+    if sig_type == "突破":
+        # 突破模式：价格已远离 EMA70(≥2×ATR)，用 ema70 做止损过宽 → 改用固定 ATR 倍数
+        sl = entry - atr * bo_sl_atr if sig > 0 else entry + atr * bo_sl_atr
+        r_size = max(abs(entry - sl), atr * 0.1)
+    elif sig > 0:
         sl = max(ema70, pullback_extreme - atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
         r_size = max(abs(entry - sl), atr * 0.1)
     else:
