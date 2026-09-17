@@ -55,5 +55,7 @@
   "sl_cushion": 0.3,
   "use_trend_cooldown": true,
   "trend_cooldown_bars": 5,
-  "timezone": "Asia/Shanghai"
+  "timezone": "Asia/Shanghai",
+  "use_momentum_filter": true,
+  "momentum_body_ratio": 0.6
 }

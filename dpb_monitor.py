@@ -77,6 +77,8 @@ def load_config():
         # 新增参数
         "use_volume_filter": True,
         "vol_ratio": 0.8,
+        "use_momentum_filter": True,   # 无 Volume 数据时用「实体/ATR」动能代理
+        "momentum_body_ratio": 0.6,    # 实体 ≥ 该倍数×ATR 视为有效动能
         "use_rsi_filter": True,
         "use_pullback_confirm": True,
         "pullback_confirm_bars": 3,
@@ -457,13 +459,26 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df["is_uptrend"] = df["stable_up"] & ~df["trend_broken_long"]
     df["is_downtrend"] = df["stable_down"] & ~df["trend_broken_short"]
     
-    # 成交量过滤
+    # 动能/成交量过滤
+    # 优先用真实成交量；若数据源无 Volume（如 XAU/USD 现货金，实测所有周期均无），
+    # 回退到用「K线实体 / ATR」作为放量动能代理，避免过滤静默失效。
     use_volume_filter = c.get("use_volume_filter", True)
     vol_ratio = c.get("vol_ratio", 0.8)
-    vol_sma = df["Volume"].rolling(20).mean() if "Volume" in df.columns else pd.Series([1]*len(df), index=df.index)
-    df["vol_pass"] = True
+    use_momentum_filter = c.get("use_momentum_filter", True)
+    momentum_body_ratio = c.get("momentum_body_ratio", 0.6)
+
+    df["body_atr"] = (df["Close"] - df["Open"]).abs() / df["atr"].replace(0, np.nan)
     if "Volume" in df.columns and use_volume_filter:
+        vol_sma = df["Volume"].rolling(20).mean()
         df["vol_pass"] = df["Volume"] > vol_sma * vol_ratio
+        df["vol_source"] = "volume"
+    elif use_momentum_filter:
+        # 无成交量：用实体/ATR 衡量 K 线动能（大实体 = 强推进）
+        df["vol_pass"] = df["body_atr"] > momentum_body_ratio
+        df["vol_source"] = "momentum"
+    else:
+        df["vol_pass"] = True
+        df["vol_source"] = "none"
     
     # 回踩触发
     use_rsi_filter = c.get("use_rsi_filter", True)
@@ -524,10 +539,13 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df["long_consec_ok"] = df["long_consec"] >= bo_consec
     df["short_consec_ok"] = df["short_consec"] >= bo_consec
     
-    # 成交量过滤
-    df["bo_vol_pass"] = True
+    # 突破动能过滤（与 vol_pass 同源：有量用成交量，无量用实体/ATR）
     if "Volume" in df.columns and use_volume_filter:
-        df["bo_vol_pass"] = df["Volume"] > vol_sma * bo_vol_ratio
+        df["bo_vol_pass"] = df["Volume"] > df["Volume"].rolling(20).mean() * bo_vol_ratio
+    elif use_momentum_filter:
+        df["bo_vol_pass"] = df["body_atr"] > (momentum_body_ratio * bo_vol_ratio)
+    else:
+        df["bo_vol_pass"] = True
     
     # 突破信号条件
     df["long_bo_signal"] = use_breakout & df["bo_stable_up"] & df["long_bo_dist"] & df["long_consec_ok"] & df["bo_vol_pass"] & ~df["trend_broken_long"]
