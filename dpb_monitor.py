@@ -385,6 +385,48 @@ def _apply_freq_preset(cfg: dict) -> dict:
     return merged
 
 
+def _score_signal(row, direction: int, mode: str, **extra) -> tuple:
+    """统一信号评分（0-8 分），回踩与突破模式共用；direction: 1=多, -1=空。
+
+    评分维度（每项 0/1）：
+      1 趋势稳定  2 趋势强度(EMA分离)  3 RSI 合理区  4 动能确认
+      5 模式项    6 形态项             7 带位/稳定性  8 结构确认
+    等级：S>=7, A>=5, B>=3, C<3
+
+    修复前：突破模式只算 3 项（上限 = B 级），回踩模式含一项"假设结构过滤通过"
+    的假分 → 实测近千根 K 线 S 级恒为 0。此函数用真实指标替代，恢复等级区分度。
+    """
+    long = direction > 0
+    atr = row["atr"]
+    s = 0
+    # 1 趋势稳定
+    s += 1 if (row["stable_up"] if long else row["stable_down"]) else 0
+    # 2 趋势强度：EMA15 与 EMA70 分离度
+    if not np.isnan(atr) and abs(row["ema15"] - row["ema70"]) > atr * 0.5:
+        s += 1
+    # 3 RSI 合理区
+    rsi = row["rsi"]
+    s += 1 if ((50 < rsi < 70) if long else (30 < rsi < 50)) else 0
+    # 4 动能确认（含 A1 的无量动能代理）
+    s += 1 if row.get("vol_pass", True) else 0
+    # 5-7 模式相关项
+    if mode == "回踩":
+        s += 1 if extra.get("pullback_depth") == 2 else 0
+        shadow = row["lower_shadow"] if long else row["upper_shadow"]
+        s += 1 if (not np.isnan(shadow) and shadow > 0.5) else 0
+        s += 1 if extra.get("band_reason") == "短→中" else 0
+    else:  # 突破
+        dist = row["long_dist"] if long else row["short_dist"]
+        s += 1 if (not np.isnan(atr) and dist > atr * 3) else 0
+        consec = row["long_consec"] if long else row["short_consec"]
+        s += 1 if consec >= 4 else 0
+        s += 1 if (row["bo_stable_up"] if long else row["bo_stable_down"]) else 0
+    # 8 结构确认：价格在慢线正确一侧
+    s += 1 if ((row["Close"] > row["ema50"]) if long else (row["Close"] < row["ema50"])) else 0
+    grade = "S" if s >= 7 else "A" if s >= 5 else "B" if s >= 3 else "C"
+    return s, grade
+
+
 def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
     计算 DPB 信号，返回带 signal 列的 DataFrame
@@ -655,12 +697,8 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
             if signals[i] == 0:  # 不覆盖回踩信号
                 signals[i] = 1
                 signal_types[i] = "突破"
-                # 突破模式也计算信号等级
-                score = 0
-                score += 1 if df["stable_up"].iloc[i] else 0
-                score += 1 if df["vol_pass"].iloc[i] else 0
-                score += 1 if df["rsi"].iloc[i] > 50 and df["rsi"].iloc[i] < 70 else 0
-                grade = "S" if score >= 7 else "A" if score >= 5 else "B" if score >= 3 else "C"
+                # 统一评分（0-8）
+                score, grade = _score_signal(df.iloc[i], 1, "突破")
                 signal_grades[i] = grade
                 signal_scores[i] = score
                 signal_bands[i] = "突破"
@@ -670,11 +708,8 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
             if signals[i] == 0:
                 signals[i] = -1
                 signal_types[i] = "突破"
-                score = 0
-                score += 1 if df["stable_down"].iloc[i] else 0
-                score += 1 if df["vol_pass"].iloc[i] else 0
-                score += 1 if df["rsi"].iloc[i] > 30 and df["rsi"].iloc[i] < 50 else 0
-                grade = "S" if score >= 7 else "A" if score >= 5 else "B" if score >= 3 else "C"
+                # 统一评分（0-8）
+                score, grade = _score_signal(df.iloc[i], -1, "突破")
                 signal_grades[i] = grade
                 signal_scores[i] = score
                 signal_bands[i] = "突破"
@@ -726,17 +761,12 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
                     state_long = 2
                     last_long_bar = i
                     
-                    # 计算信号等级
-                    score = 0
-                    score += 1 if df["stable_up"].iloc[i] else 0
-                    score += 1  # 假设结构过滤通过（Python未实现）
-                    score += 1 if df["rsi"].iloc[i] > 50 and df["rsi"].iloc[i] < 70 else 0
-                    score += 1 if long_pullback_depth == 2 else 0
-                    score += 1 if df["vol_pass"].iloc[i] else 0
-                    score += 1 if df["lower_shadow"].iloc[i] > 0.5 else 0
-                    score += 1 if long_band_reason == "短→中" else 0
-                    long_signal_score = score
-                    long_signal_grade = "S" if score >= 7 else "A" if score >= 5 else "B" if score >= 3 else "C"
+                    # 统一评分（0-8，替代原先含"假设结构过滤"假分的 7 项）
+                    long_signal_score, long_signal_grade = _score_signal(
+                        df.iloc[i], 1, "回踩",
+                        pullback_depth=long_pullback_depth,
+                        band_reason=long_band_reason,
+                    )
                 elif long_confirm_window > pullback_confirm_bars:
                     state_long = 0
                     band_long = ""
@@ -790,17 +820,12 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
                     state_short = 2
                     last_short_bar = i
                     
-                    # 计算信号等级
-                    score = 0
-                    score += 1 if df["stable_down"].iloc[i] else 0
-                    score += 1  # 假设结构过滤通过
-                    score += 1 if df["rsi"].iloc[i] > 30 and df["rsi"].iloc[i] < 50 else 0
-                    score += 1 if short_pullback_depth == 2 else 0
-                    score += 1 if df["vol_pass"].iloc[i] else 0
-                    score += 1 if df["upper_shadow"].iloc[i] > 0.5 else 0
-                    score += 1 if short_band_reason == "短→中" else 0
-                    short_signal_score = score
-                    short_signal_grade = "S" if score >= 7 else "A" if score >= 5 else "B" if score >= 3 else "C"
+                    # 统一评分（0-8，替代原先含"假设结构过滤"假分的 7 项）
+                    short_signal_score, short_signal_grade = _score_signal(
+                        df.iloc[i], -1, "回踩",
+                        pullback_depth=short_pullback_depth,
+                        band_reason=short_band_reason,
+                    )
                 elif short_confirm_window > pullback_confirm_bars:
                     state_short = 0
                     band_short = ""
