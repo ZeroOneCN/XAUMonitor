@@ -334,22 +334,35 @@ def calc_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+# 交易频率预设：仅当 config 未显式提供对应参数时兜底
+_FREQ_PRESETS = {
+    "保守": {"trend_stability": 20, "signal_cooldown": 10, "breakout_tolerance": 5},
+    "标准": {"trend_stability": 15, "signal_cooldown": 5, "breakout_tolerance": 3},
+    "激进": {"trend_stability": 10, "signal_cooldown": 3, "breakout_tolerance": 2},
+}
+
+
+def _apply_freq_preset(cfg: dict) -> dict:
+    """套用交易频率预设作为兜底，但 config 中显式提供的参数优先。
+
+    修复前：无论 config 写什么，trend_stability / signal_cooldown /
+    breakout_tolerance 都会被 trade_freq 强制覆盖 → 用户改 config 无效。
+    """
+    freq = cfg.get("trade_freq", "激进")
+    preset = _FREQ_PRESETS.get(freq, _FREQ_PRESETS["激进"])
+    merged = {k: v for k, v in preset.items() if k not in cfg}
+    merged.update(cfg)
+    return merged
+
+
 def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
     计算 DPB 信号，返回带 signal 列的 DataFrame
     signal: 0=无, 1=买入, -1=卖出
     """
-    c = cfg
-    
-    # 交易频率自适应（与TV同步）
-    freq = c.get("trade_freq", "激进")
-    if freq == "保守":
-        c = {**c, "trend_stability": 20, "signal_cooldown": 10, "breakout_tolerance": 5}
-    elif freq == "标准":
-        c = {**c, "trend_stability": 15, "signal_cooldown": 5, "breakout_tolerance": 3}
-    else:  # 激进
-        c = {**c, "trend_stability": 10, "signal_cooldown": 3, "breakout_tolerance": 2}
-    
+    # config 显式参数优先，trade_freq 仅在缺省时兜底
+    c = _apply_freq_preset(cfg)
+
     df = df.copy()
     
     # EMA
@@ -943,7 +956,16 @@ def main():
     
     cfg = load_config()
     state = load_state(cfg["state_file"])
-    
+
+    # 启动时打印实际生效的风险参数，避免"改了 config 却不生效"的黑箱
+    _eff = _apply_freq_preset(cfg)
+    log.info(
+        f"[配置] trade_freq={cfg.get('trade_freq', '激进')} | "
+        f"生效: trend_stability={_eff['trend_stability']}, "
+        f"signal_cooldown={_eff['signal_cooldown']}, "
+        f"breakout_tolerance={_eff['breakout_tolerance']}"
+    )
+
     if args.loop:
         interval = cfg.get("check_interval_minutes", 5) * 60
         log.info(f"[启动] 循环监控模式, 间隔 {interval//60} 分钟")
