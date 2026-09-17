@@ -47,6 +47,7 @@ def load_config():
     
     default = {
         "wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY_HERE",
+        "wecom_webhooks": [],   # B10 额外告警通道（多机器人冗余，任一成功即可）
         "twelve_data_key": "YOUR_API_KEY_HERE",
         "ticker": "GC=F",
         "ticker_td": "XAU/USD",
@@ -187,18 +188,16 @@ def _track_request(key: str):
             warned.add(th)
             pct = int(th * 100)
             log.warning(f"[额度] key {key[:6]}... 今日已用 {used}/{_DAILY_LIMIT} ({pct}%+)")
-            # 推送到企业微信：避免额度耗尽后监控静默停摆却无人知晓
+            # 推送到所有告警通道（B10 冗余）：避免额度耗尽后监控静默停摆却无人知晓
             try:
                 cfg = load_config()
-                webhook = cfg.get("wecom_webhook", "")
-                if webhook and "YOUR" not in webhook:
-                    send_wecom(
-                        webhook,
-                        "⚠️ Twelve Data 额度告警",
-                        f"> key `{key[:6]}...`\n"
-                        f"> 今日已用 **{used}/{_DAILY_LIMIT}**（已达 {pct}%）\n"
-                        f"> 额度用尽后该 key 将暂停 {_KEY_RETRY_AFTER // 3600} 小时",
-                    )
+                send_alert(
+                    cfg,
+                    "⚠️ Twelve Data 额度告警",
+                    f"> key `{key[:6]}...`\n"
+                    f"> 今日已用 **{used}/{_DAILY_LIMIT}**（已达 {pct}%）\n"
+                    f"> 额度用尽后该 key 将暂停 {_KEY_RETRY_AFTER // 3600} 小时",
+                )
             except Exception as e:
                 log.error(f"[额度] 告警推送失败: {e}")
             break  # 每次请求最多触发一个阈值
@@ -876,6 +875,41 @@ def send_wecom(webhook: str, title: str, content: str):
         log.error(f"[推送] 失败: {result}")
 
 
+def _webhook_list(cfg: dict) -> list:
+    """返回所有已配置的告警 webhook（B10 多通道冗余，去重）。"""
+    whs = list(cfg.get("wecom_webhooks") or [])
+    single = cfg.get("wecom_webhook")
+    if single and single not in whs:
+        whs.insert(0, single)
+    return [w for w in whs if w and "YOUR" not in w]
+
+
+def send_alert(cfg: dict, title: str, content: str) -> bool:
+    """向所有配置的告警通道推送，任一成功即返回 True（B10 告警通道冗余）。
+
+    单通道故障（如单个企业微信机器人被限/失效）不再导致告警丢失。
+    """
+    whs = _webhook_list(cfg)
+    if not whs:
+        log.error("[推送] 未配置任何告警 webhook")
+        return False
+    ok = False
+    for wh in whs:
+        try:
+            payload = {"msgtype": "markdown", "markdown": {"content": f"## {title}\n{content}"}}
+            resp = _session.post(wh, json=payload, timeout=10)
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("errcode") == 0:
+                log.info(f"[推送] 成功: {title} → ...{wh[-8:]}")
+                ok = True
+            else:
+                log.error(f"[推送] 失败({wh[-8:]}): {result}")
+        except Exception as e:
+            log.error(f"[推送] 异常({wh[-8:]}): {e}")
+    return ok
+
+
 def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
     """统一计算止损/止盈，返回 (entry, sl, r_size, r1, r2, tp1, tp2)。
     原逻辑在 format_signal_msg 与 check_signals 中重复，抽成单一来源避免漂移。"""
@@ -1089,7 +1123,7 @@ def check_signals(cfg: dict, state: dict) -> dict:
             res_tfs = same_tfs if len(same_tfs) >= resonance_min else None
 
             title, content = format_signal_msg(tf, sig, last, cfg, resonance_tfs=res_tfs)
-            send_wecom(cfg["wecom_webhook"], title, content)
+            send_alert(cfg, title, content)
             state[key] = last.name.isoformat()
             log.info(f"[信号] {title} @ {last['Close']:.2f}")
 
