@@ -66,6 +66,7 @@ def load_config():
         "trend_stability": 20,
         "signal_cooldown": 10,
         "breakout_tolerance": 5,
+        "min_signal_grade": "C",   # 最低推送等级(S/A/B/C)，治理信号过频
         "rsi_len": 14,
         "rsi_long_min": 40,
         "rsi_short_max": 60,
@@ -371,6 +372,9 @@ _FREQ_PRESETS = {
     "标准": {"trend_stability": 15, "signal_cooldown": 5, "breakout_tolerance": 3},
     "激进": {"trend_stability": 10, "signal_cooldown": 3, "breakout_tolerance": 2},
 }
+
+# 信号等级序（用于 A5 最小等级门槛过滤）
+_GRADE_ORDER = {"C": 0, "B": 1, "A": 2, "S": 3}
 
 
 def _apply_freq_preset(cfg: dict) -> dict:
@@ -984,7 +988,14 @@ def check_signals(cfg: dict, state: dict) -> dict:
             # 取最后一根K线
             last = df.iloc[-1]
             sig = int(last["signal"])
-            
+
+            # A5 信号等级门槛：低于 min_signal_grade 的信号不推送（治理信号过频）
+            min_grade = cfg.get("min_signal_grade", "C")
+            grade_now = last.get("signal_grade", "")
+            if sig != 0 and _GRADE_ORDER.get(grade_now, 0) < _GRADE_ORDER.get(min_grade, 0):
+                log.info(f"[过滤] {tf} {grade_now}级 低于门槛 {min_grade} → 跳过推送")
+                continue
+
             # 去重：同一周期同一方向不重复推送
             key = f"{tf}_{sig}"
             if sig != 0 and state.get(key) != last.name.isoformat():

@@ -58,5 +58,6 @@
   "timezone": "Asia/Shanghai",
   "use_momentum_filter": true,
   "momentum_body_ratio": 0.6,
-  "breakout_sl_atr": 1.5
+  "breakout_sl_atr": 1.5,
+  "min_signal_grade": "C"
 }
