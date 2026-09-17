@@ -137,6 +137,9 @@ _daily_req = {}          # key -> 当天成功请求次数
 _daily_req_day = ""      # 当天日期串（用于跨天重置）
 _DAILY_LIMIT = 800       # 每个 key 每日额度
 _REQUEST_WARN_RATIO = 0.8  # 使用量达 80% 时告警
+# 额度告警阈值（占每日额度比例）——每 key 每阈值每天仅告警一次，避免刷屏
+_WARN_THRESHOLDS = (_REQUEST_WARN_RATIO, 0.9, 0.95, 1.0)
+_warned_thresholds = {}  # key -> set(今日已告警的阈值)
 
 # 复用连接，减少海外握手开销、降低超时概率
 _session = requests.Session()
@@ -153,20 +156,45 @@ def _rotate_key(keys: list) -> str:
     return key
 
 def _reset_daily_if_needed():
-    """跨天重置请求计数"""
-    global _daily_req_day, _daily_req
+    """跨天重置请求计数与告警状态"""
+    global _daily_req_day, _daily_req, _warned_thresholds
     today = datetime.now().strftime("%Y-%m-%d")
     if _daily_req_day != today:
         _daily_req_day = today
         _daily_req = {}
+        _warned_thresholds = {}
 
 def _track_request(key: str):
-    """记录一次成功请求，并在接近额度上限时告警"""
+    """记录一次成功请求；跨过额度阈值时告警（日志 + 企业微信，每阈值每天仅一次）
+
+    修复前：`used >= 80%` 在 640 次之后恒为真 → 每次请求都告警（刷屏），
+    且告警只写日志不推送，key 打满后监控静默停摆无人知晓。
+    """
     _reset_daily_if_needed()
     _daily_req[key] = _daily_req.get(key, 0) + 1
     used = _daily_req[key]
-    if used % 100 == 0 or used >= int(_DAILY_LIMIT * _REQUEST_WARN_RATIO):
-        log.warning(f"[额度] key {key[:6]}... 今日已用 {used}/{_DAILY_LIMIT} 次")
+    ratio = used / _DAILY_LIMIT
+    warned = _warned_thresholds.setdefault(key, set())
+    for th in _WARN_THRESHOLDS:
+        if ratio >= th and th not in warned:
+            warned.add(th)
+            pct = int(th * 100)
+            log.warning(f"[额度] key {key[:6]}... 今日已用 {used}/{_DAILY_LIMIT} ({pct}%+)")
+            # 推送到企业微信：避免额度耗尽后监控静默停摆却无人知晓
+            try:
+                cfg = load_config()
+                webhook = cfg.get("wecom_webhook", "")
+                if webhook and "YOUR" not in webhook:
+                    send_wecom(
+                        webhook,
+                        "⚠️ Twelve Data 额度告警",
+                        f"> key `{key[:6]}...`\n"
+                        f"> 今日已用 **{used}/{_DAILY_LIMIT}**（已达 {pct}%）\n"
+                        f"> 额度用尽后该 key 将暂停 {_KEY_RETRY_AFTER // 3600} 小时",
+                    )
+            except Exception as e:
+                log.error(f"[额度] 告警推送失败: {e}")
+            break  # 每次请求最多触发一个阈值
 
 def _throttle():
     """按 key 数自适应间隔：加大请求密度，同时每个 key 不超每分钟 8 次"""
