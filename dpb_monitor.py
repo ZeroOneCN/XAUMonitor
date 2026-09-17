@@ -14,6 +14,7 @@ import json
 import time
 import logging
 import argparse
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -75,6 +76,7 @@ def load_config():
         "risk2": 3.0,
         "check_interval_minutes": 5,
         "state_file": str(Path(__file__).parent / "dpb_state.json"),
+        "db_file": "signals.db",   # B8 信号持久化数据库
         "timezone": TZ_NAME,
         # 新增参数
         "use_volume_filter": True,
@@ -980,6 +982,61 @@ def save_state(state_file: str, state: dict):
 
 
 # ============================================================
+# B8 信号持久化（SQLite，便于复盘 / 统计胜率）
+# ============================================================
+def _db_path(db_file: str) -> Path:
+    p = Path(db_file)
+    return p if p.is_absolute() else Path(__file__).parent / p
+
+
+def init_db(db_file: str):
+    """建表（幂等），启动时调用一次"""
+    try:
+        with sqlite3.connect(_db_path(db_file)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT, pushed_at TEXT, timeframe TEXT, direction INTEGER,
+                    sig_type TEXT, grade TEXT, score INTEGER, band TEXT,
+                    entry REAL, sl REAL, tp1 REAL, tp2 REAL, r_size REAL,
+                    rsi REAL, atr REAL, resonance INTEGER, close REAL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_tf_ts ON signals(timeframe, ts)")
+            conn.commit()
+    except Exception as e:
+        log.error(f"[DB] 建表失败: {e}")
+
+
+def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_size, resonance):
+    """写入一条信号记录（失败仅记日志，不影响推送）"""
+    try:
+        with sqlite3.connect(_db_path(db_file)) as conn:
+            conn.execute(
+                "INSERT INTO signals (ts, pushed_at, timeframe, direction, sig_type, grade,"
+                " score, band, entry, sl, tp1, tp2, r_size, rsi, atr, resonance, close)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row.name.isoformat(),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    tf,
+                    int(sig),
+                    row.get("signal_type", ""),
+                    row.get("signal_grade", ""),
+                    int(row.get("signal_score", 0) or 0),
+                    row.get("signal_band", ""),
+                    float(entry), float(sl), float(tp1), float(tp2), float(r_size),
+                    float(row["rsi"]), float(row["atr"]),
+                    int(resonance or 0),
+                    float(row["Close"]),
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        log.error(f"[DB] 信号写入失败: {e}")
+
+
+# ============================================================
 # 主循环
 # ============================================================
 def check_signals(cfg: dict, state: dict) -> dict:
@@ -1061,6 +1118,13 @@ def check_signals(cfg: dict, state: dict) -> dict:
                 f"RSI:{last['rsi']:.1f} ATR:{atr:.2f} {vol_status} | "
                 f"趋势:{trend_status}"
             )
+
+            # B8 持久化到 SQLite（便于后续复盘/统计胜率）
+            save_signal_db(
+                cfg.get("db_file", "signals.db"), tf, sig, last,
+                entry, sl, tp1, tp2, r_size,
+                len(res_tfs) if res_tfs else 0,
+            )
         except Exception as e:
             log.error(f"[错误] {tf} 推送失败: {e}")
 
@@ -1074,6 +1138,7 @@ def main():
     
     cfg = load_config()
     state = load_state(cfg["state_file"])
+    init_db(cfg.get("db_file", "signals.db"))   # B8 初始化信号库（幂等）
 
     # 启动时打印实际生效的风险参数，避免"改了 config 却不生效"的黑箱
     _eff = _apply_freq_preset(cfg)

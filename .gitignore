@@ -2,6 +2,10 @@
 dpb_config.json
 dpb_state.json
 
+# 运行数据（B8 信号库）
+signals.db
+*.db
+
 # 运行日志
 dpb_signals.log
 dpb_signals.txt

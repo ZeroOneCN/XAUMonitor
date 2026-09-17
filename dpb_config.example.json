@@ -60,5 +60,6 @@
   "momentum_body_ratio": 0.6,
   "breakout_sl_atr": 1.5,
   "min_signal_grade": "C",
-  "resonance_min_count": 2
+  "resonance_min_count": 2,
+  "db_file": "signals.db"
 }
