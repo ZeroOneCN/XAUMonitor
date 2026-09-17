@@ -1,0 +1,58 @@
+{
+  "wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WECOM_KEY",
+  "twelve_data_key": "YOUR_API_KEY_HERE",
+  "twelve_data_keys": [
+    "YOUR_KEY_1",
+    "YOUR_KEY_2",
+    "YOUR_KEY_3"
+  ],
+  "ticker": "GC=F",
+  "ticker_td": "XAU/USD",
+  "timeframes": {
+    "5m": {
+      "interval": "5min"
+    },
+    "15m": {
+      "interval": "15min"
+    },
+    "1h": {
+      "interval": "1h"
+    },
+    "4h": {
+      "interval": "4h"
+    },
+    "1d": {
+      "interval": "1day"
+    }
+  },
+  "ema": {
+    "short1": 15,
+    "short2": 25,
+    "mid1": 50,
+    "mid2": 70
+  },
+  "trade_freq": "激进",
+  "use_breakout": true,
+  "breakout_stability": 8,
+  "breakout_dist_atr": 2.0,
+  "breakout_consec": 3,
+  "breakout_vol_ratio": 1.0,
+  "trend_stability": 20,
+  "signal_cooldown": 10,
+  "breakout_tolerance": 5,
+  "rsi_len": 14,
+  "rsi_long_min": 40,
+  "rsi_short_max": 60,
+  "risk1": 1.5,
+  "risk2": 3.0,
+  "check_interval_minutes": 4,
+  "state_file": "dpb_state.json",
+  "use_volume_filter": true,
+  "vol_ratio": 0.8,
+  "use_rsi_filter": true,
+  "use_pullback_confirm": true,
+  "pullback_confirm_bars": 3,
+  "sl_cushion": 0.3,
+  "use_trend_cooldown": true,
+  "trend_cooldown_bars": 5
+}

@@ -1,0 +1,14 @@
+# 敏感/私有文件（不含密钥才可上传）
+dpb_config.json
+dpb_state.json
+
+# 运行日志
+dpb_signals.log
+dpb_signals.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

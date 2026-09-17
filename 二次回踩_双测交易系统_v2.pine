@@ -1,0 +1,749 @@
+//@version=5
+// ============================================================
+//  二次回踩·DPB v6.0
+//  A.价格结构过滤 + B.跨带回踩 + C.结构位止损止盈
+//  D.分批出场移动止损 + E.信号强度分级
+// ------------------------------------------------------------
+indicator("二次回踩·DPB v6.0", "DPB v6.0", overlay=true, max_labels_count=50)
+
+// ==========================================
+// 输入参数
+// ==========================================
+grp_ema    = "EMA 设置"
+len_ema_15 = input.int(15, "短EMA1", group=grp_ema)
+len_ema_25 = input.int(25, "短EMA2", group=grp_ema)
+len_ema_50 = input.int(50, "中EMA1", group=grp_ema)
+len_ema_70 = input.int(70, "中EMA2/止损线", group=grp_ema)
+
+grp_filter = "趋势过滤"
+trade_freq = input.string("激进", "交易频率", options=["保守", "标准", "激进"], group=grp_filter, tooltip="保守=信号少质量高，激进=信号多适合超短线")
+trend_stability    = trade_freq == "保守" ? 20 : trade_freq == "标准" ? 15 : 10
+signal_cooldown    = trade_freq == "保守" ? 10 : trade_freq == "标准" ? 5 : 3
+breakout_tolerance = trade_freq == "保守" ? 5 : trade_freq == "标准" ? 3 : 2
+
+grp_structure = "A.价格结构过滤"
+use_structure    = input.bool(true,  "启用HH/HL结构过滤", group=grp_structure, tooltip="多头要求HH+HL，空头要求LH+LL")
+pivot_len        = input.int(5,      "Pivot检测K数", minval=2, maxval=20, group=grp_structure)
+
+grp_confirm = "信号确认"
+use_rsi_filter    = input.bool(true,  "启用RSI过滤", group=grp_confirm)
+rsi_len           = input.int(14,     "RSI周期", group=grp_confirm)
+rsi_long_min      = input.int(40,     "做多RSI下限", group=grp_confirm)
+rsi_short_max     = input.int(60,     "做空RSI上限", group=grp_confirm)
+use_mtf_filter    = input.bool(false, "启用大周期趋势确认", group=grp_confirm)
+mtf_tf            = input.timeframe("240", "大周期", group=grp_confirm)
+mtf_ema_len       = input.int(50,     "大周期EMA", group=grp_confirm)
+
+grp_confirm2 = "回踩力度确认"
+use_pullback_confirm = input.bool(true, "启用回踩力度确认", group=grp_confirm2)
+pullback_confirm_bars = input.int(3, "确认窗口K线数", minval=1, maxval=10, group=grp_confirm2)
+
+grp_volume = "成交量过滤"
+use_volume_filter = input.bool(true, "启用成交量过滤", group=grp_volume)
+vol_ratio = input.float(0.8, "成交量倍数", minval=0.1, step=0.1, group=grp_volume)
+
+grp_risk = "C.风控/结构位止损止盈"
+use_auto_risk = input.bool(true, "按周期自动适配盈亏比", group=grp_risk)
+risk1 = input.float(1.5, "目标1 盈亏比（手动）", minval=0.5, step=0.5, group=grp_risk)
+risk2 = input.float(3.0, "目标2 盈亏比（手动）", minval=0.5, step=0.5, group=grp_risk)
+sl_cushion = input.float(0.3, "止损安全垫ATR系数", minval=0, step=0.1, group=grp_risk)
+use_structure_sl = input.bool(true, "启用结构位止损", group=grp_risk, tooltip="止损设在最近Pivot低点下方")
+use_structure_tp = input.bool(true, "启用结构位止盈", group=grp_risk, tooltip="阻力位比TP更近时用阻力位")
+
+grp_trailing = "D.分批出场"
+use_trailing = input.bool(true, "启用TP1后移动止损", group=grp_trailing, tooltip="TP1触达后止损移至入场价保本")
+
+grp_trend = "趋势反转保护"
+use_trend_cooldown = input.bool(true, "启用趋势反转冷却", group=grp_trend)
+trend_cooldown_bars = input.int(5, "反转冷却K线数", minval=1, maxval=20, group=grp_trend)
+
+grp_breakout = "F.突破模式（补急涨急跌）"
+use_breakout = input.bool(true, "启用突破模式", group=grp_breakout, tooltip="趋势刚确立+价格远离EMA+动能强时直接出信号，不等回踩")
+breakout_stability = input.int(8, "突破模式趋势稳定K数", minval=3, maxval=15, group=grp_breakout, tooltip="比回踩模式更短，快速响应")
+breakout_dist_atr = input.float(2.0, "价格离EMA70的ATR倍数", minval=1.0, step=0.5, group=grp_breakout, tooltip="价格距离EMA70超过N倍ATR才视为突破")
+breakout_consec = input.int(3, "连续同向K线数", minval=2, maxval=5, group=grp_breakout)
+breakout_vol_ratio = input.float(1.0, "突破成交量倍数", minval=0.5, step=0.1, group=grp_breakout)
+
+grp_stat = "胜率统计"
+stat_window = input.int(20, "每笔追踪K线数", minval=5, maxval=100, group=grp_stat)
+
+grp_visual = "视觉"
+show_score = input.bool(true, "显示信号质量评分", group=grp_visual)
+
+// ==========================================
+// 基础计算
+// ==========================================
+ema15 = ta.ema(close, len_ema_15)
+ema25 = ta.ema(close, len_ema_25)
+ema50 = ta.ema(close, len_ema_50)
+ema70 = ta.ema(close, len_ema_70)
+atr14 = ta.atr(14)
+rsi14 = ta.rsi(close, rsi_len)
+volSMA20 = ta.sma(volume, 20)
+
+mtf_ema = request.security(syminfo.tickerid, mtf_tf, ta.ema(close, mtf_ema_len))
+mtf_uptrend = close > mtf_ema
+mtf_downtrend = close < mtf_ema
+
+range_size = high - low
+lower_shadow_ratio = range_size > 0 ? (close < open ? (close - low) / range_size : (open - low) / range_size) : 0
+upper_shadow_ratio = range_size > 0 ? (close < open ? (high - open) / range_size : (high - close) / range_size) : 0
+is_green = close > open
+is_red   = close < open
+
+// ==========================================
+// A. 价格结构检测
+// ==========================================
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low, pivot_len, pivot_len)
+
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
+
+if not na(ph)
+    ph2 := ph1
+    ph1 := ph
+
+if not na(pl)
+    pl2 := pl1
+    pl1 := pl
+
+is_hh = not na(ph1) and not na(ph2) and ph1 > ph2
+is_hl = not na(pl1) and not na(pl2) and pl1 > pl2
+is_lh = not na(ph1) and not na(ph2) and ph1 < ph2
+is_ll = not na(pl1) and not na(pl2) and pl1 < pl2
+
+structure_long  = is_hh and is_hl
+structure_short = is_lh and is_ll
+
+structure_pass_long  = use_structure ? structure_long  : true
+structure_pass_short = use_structure ? structure_short : true
+
+// ==========================================
+// 周期自适应盈亏比
+// ==========================================
+tfMin = timeframe.in_seconds() / 60
+auto_risk1 = tfMin <= 15 ? 1.0 : tfMin <= 60 ? 1.5 : tfMin <= 240 ? 2.0 : 3.0
+auto_risk2 = tfMin <= 15 ? 2.0 : tfMin <= 60 ? 3.0 : tfMin <= 240 ? 4.0 : 6.0
+final_risk1 = use_auto_risk ? auto_risk1 : risk1
+final_risk2 = use_auto_risk ? auto_risk2 : risk2
+
+// ==========================================
+// 趋势定义
+// ==========================================
+fast_band_top    = math.max(ema15, ema25)
+fast_band_bottom = math.min(ema15, ema25)
+slow_band_top    = math.max(ema50, ema70)
+slow_band_bottom = math.min(ema50, ema70)
+
+raw_uptrend   = fast_band_bottom > slow_band_top
+raw_downtrend = fast_band_top < slow_band_bottom
+
+is_stable_uptrend   = math.sum(raw_uptrend ? 1 : 0, trend_stability) == trend_stability
+is_stable_downtrend = math.sum(raw_downtrend ? 1 : 0, trend_stability) == trend_stability
+
+price_break_long  = close < ema70
+price_break_short = close > ema70
+
+var int consecutive_break_long  = 0
+var int consecutive_break_short = 0
+
+if price_break_long
+    consecutive_break_long += 1
+else
+    consecutive_break_long := 0
+
+if price_break_short
+    consecutive_break_short += 1
+else
+    consecutive_break_short := 0
+
+trend_broken_long  = consecutive_break_long  > breakout_tolerance
+trend_broken_short = consecutive_break_short > breakout_tolerance
+
+is_uptrend   = is_stable_uptrend   and not trend_broken_long
+is_downtrend = is_stable_downtrend and not trend_broken_short
+
+reset_long  = trend_broken_long
+reset_short = trend_broken_short
+
+// ==========================================
+// 趋势反转检测
+// ==========================================
+var bool long_trend_cooldown  = false
+var bool short_trend_cooldown = false
+var int  long_cooldown_bars   = 0
+var int  short_cooldown_bars  = 0
+
+if is_uptrend and not is_uptrend[1]
+    long_trend_cooldown := true
+    long_cooldown_bars := 0
+
+if is_downtrend and not is_downtrend[1]
+    short_trend_cooldown := true
+    short_cooldown_bars := 0
+
+if long_trend_cooldown
+    long_cooldown_bars += 1
+    if long_cooldown_bars >= trend_cooldown_bars
+        long_trend_cooldown := false
+
+if short_trend_cooldown
+    short_cooldown_bars += 1
+    if short_cooldown_bars >= trend_cooldown_bars
+        short_trend_cooldown := false
+
+long_trend_ok  = use_trend_cooldown ? not long_trend_cooldown  : true
+short_trend_ok = use_trend_cooldown ? not short_trend_cooldown : true
+
+// ==========================================
+// F. 突破模式检测
+// ==========================================
+// 突破模式：趋势刚确立 + 价格远离EMA70 + 连续同向K线 + 放量
+// 用于捕捉急涨急跌行情（回踩模式会漏掉）
+
+// 突破模式用更短的稳定性要求
+breakout_stable_up   = math.sum(raw_uptrend ? 1 : 0, breakout_stability) == breakout_stability
+breakout_stable_down = math.sum(raw_downtrend ? 1 : 0, breakout_stability) == breakout_stability
+
+// 价格距离EMA70超过N倍ATR
+long_dist_from_ema70  = close - ema70
+short_dist_from_ema70 = ema70 - close
+long_breakout_dist  = long_dist_from_ema70  > atr14 * breakout_dist_atr
+short_breakout_dist = short_dist_from_ema70 > atr14 * breakout_dist_atr
+
+// 连续N根同向K线
+var int long_consec_green  = 0
+var int short_consec_red   = 0
+if is_green
+    long_consec_green += 1
+else
+    long_consec_green := 0
+if is_red
+    short_consec_red += 1
+else
+    short_consec_red := 0
+
+long_consec_ok  = long_consec_green  >= breakout_consec
+short_consec_ok = short_consec_red   >= breakout_consec
+
+// 突破模式成交量
+breakout_vol_pass = use_volume_filter ? volume > volSMA20 * breakout_vol_ratio : true
+
+// 突破信号条件
+long_breakout_signal  = use_breakout and breakout_stable_up   and long_breakout_dist  and long_consec_ok  and breakout_vol_pass and not trend_broken_long
+short_breakout_signal = use_breakout and breakout_stable_down and short_breakout_dist and short_consec_ok and breakout_vol_pass and not trend_broken_short
+
+// 突破模式冷却（独立于回踩模式）
+var int last_long_breakout_bar  = -999999
+var int last_short_breakout_bar = -999999
+long_breakout_cooldown  = bar_index - last_long_breakout_bar  > signal_cooldown
+short_breakout_cooldown = bar_index - last_short_breakout_bar > signal_cooldown
+
+final_long_breakout  = long_breakout_signal  and long_breakout_cooldown  and barstate.isconfirmed
+final_short_breakout = short_breakout_signal and short_breakout_cooldown and barstate.isconfirmed
+
+if final_long_breakout
+    last_long_breakout_bar := bar_index
+if final_short_breakout
+    last_short_breakout_bar := bar_index
+
+// ==========================================
+// 回踩触发
+// ==========================================
+vol_pass = use_volume_filter ? volume > volSMA20 * vol_ratio : true
+
+support_short_band  = low <= ema15 and close >= ema25
+support_medium_band = low <= ema50 and close >= ema70
+valid_shape_long    = is_green or lower_shadow_ratio > 0.3
+rsi_pass_long       = use_rsi_filter ? rsi14 > rsi_long_min : true
+
+long_trigger_short  = is_uptrend and support_short_band  and valid_shape_long and rsi_pass_long and vol_pass
+long_trigger_medium = is_uptrend and support_medium_band and valid_shape_long and rsi_pass_long and vol_pass
+
+resist_short_band  = high >= ema15 and close <= ema25
+resist_medium_band = high >= ema50 and close <= ema70
+valid_shape_short  = is_red or upper_shadow_ratio > 0.3
+rsi_pass_short     = use_rsi_filter ? rsi14 < rsi_short_max : true
+
+short_trigger_short  = is_downtrend and resist_short_band  and valid_shape_short and rsi_pass_short and vol_pass
+short_trigger_medium = is_downtrend and resist_medium_band and valid_shape_short and rsi_pass_short and vol_pass
+
+// ==========================================
+// 冷却系统
+// ==========================================
+var int last_long_signal_bar  = -999999
+var int last_short_signal_bar = -999999
+var int longLabelOffset  = 0
+var int shortLabelOffset = 0
+
+long_cooldown_passed  = bar_index - last_long_signal_bar  > signal_cooldown
+short_cooldown_passed = bar_index - last_short_signal_bar > signal_cooldown
+
+// ==========================================
+// B. 状态机（支持跨带）
+// ==========================================
+var int   state_long  = 0
+var string band_long  = "NA"
+var int   state_short = 0
+var string band_short = "NA"
+var string longBandReason  = ""
+var string shortBandReason = ""
+var string longSignalGrade = ""
+var string shortSignalGrade = ""
+
+var float long_pullback_high  = na
+var float short_pullback_low  = na
+var int   long_confirm_window  = 0
+var int   short_confirm_window = 0
+var int   long_pullback_depth  = 0
+var int   short_pullback_depth = 0
+
+if reset_long
+    state_long := 0
+    band_long := "NA"
+    long_confirm_window := 0
+    long_pullback_depth := 0
+else if is_uptrend
+    if state_long == 0
+        if long_cooldown_passed and long_trend_ok and structure_pass_long
+            if long_trigger_short
+                state_long := 1
+                band_long := "SHORT"
+                last_long_signal_bar := bar_index
+                long_pullback_high := high
+                long_confirm_window := 0
+                long_pullback_depth := 1
+            else if long_trigger_medium
+                state_long := 1
+                band_long := "MEDIUM"
+                last_long_signal_bar := bar_index
+                long_pullback_high := high
+                long_confirm_window := 0
+                long_pullback_depth := 2
+    else if state_long == 1
+        long_confirm_window += 1
+        long_confirmed = false
+        if use_pullback_confirm
+            long_confirmed := is_green and close > long_pullback_high and long_confirm_window <= pullback_confirm_bars
+        else
+            if band_long == "SHORT"
+                long_confirmed := long_trigger_short or long_trigger_medium
+            else
+                long_confirmed := long_trigger_medium
+        
+        if long_confirmed
+            longBandReason := band_long == "SHORT" ? "短带" : "中带"
+            if band_long == "SHORT" and (long_trigger_medium or close < ema50)
+                longBandReason := "短→中"
+            state_long := 2
+            last_long_signal_bar := bar_index
+        else if long_confirm_window > pullback_confirm_bars
+            state_long := 0
+            band_long := "NA"
+            long_confirm_window := 0
+    else if state_long == 2
+        state_long := 0
+        band_long := "NA"
+
+if reset_short
+    state_short := 0
+    band_short := "NA"
+    short_confirm_window := 0
+    short_pullback_depth := 0
+else if is_downtrend
+    if state_short == 0
+        if short_cooldown_passed and short_trend_ok and structure_pass_short
+            if short_trigger_short
+                state_short := 1
+                band_short := "SHORT"
+                last_short_signal_bar := bar_index
+                short_pullback_low := low
+                short_confirm_window := 0
+                short_pullback_depth := 1
+            else if short_trigger_medium
+                state_short := 1
+                band_short := "MEDIUM"
+                last_short_signal_bar := bar_index
+                short_pullback_low := low
+                short_confirm_window := 0
+                short_pullback_depth := 2
+    else if state_short == 1
+        short_confirm_window += 1
+        short_confirmed = false
+        if use_pullback_confirm
+            short_confirmed := is_red and close < short_pullback_low and short_confirm_window <= pullback_confirm_bars
+        else
+            if band_short == "SHORT"
+                short_confirmed := short_trigger_short or short_trigger_medium
+            else
+                short_confirmed := short_trigger_medium
+        
+        if short_confirmed
+            shortBandReason := band_short == "SHORT" ? "短带" : "中带"
+            if band_short == "SHORT" and (short_trigger_medium or close > ema50)
+                shortBandReason := "短→中"
+            state_short := 2
+            last_short_signal_bar := bar_index
+        else if short_confirm_window > pullback_confirm_bars
+            state_short := 0
+            band_short := "NA"
+            short_confirm_window := 0
+    else if state_short == 2
+        state_short := 0
+        band_short := "NA"
+
+// ==========================================
+// 信号识别（回踩 + 突破双模式）
+// ==========================================
+// 每根新K线重置标签偏移（防止跨bar累积）
+var int lastLabelBar = -1
+if bar_index != lastLabelBar
+    longLabelOffset  := 0
+    shortLabelOffset := 0
+    lastLabelBar := bar_index
+
+is_buy_signal  = state_long[1]  == 2
+is_sell_signal = state_short[1] == 2
+
+mtf_pass_long  = use_mtf_filter ? mtf_uptrend  : true
+mtf_pass_short = use_mtf_filter ? mtf_downtrend : true
+
+final_buy_signal  = (is_buy_signal  or final_long_breakout)  and mtf_pass_long  and barstate.isconfirmed
+final_sell_signal = (is_sell_signal or final_short_breakout) and mtf_pass_short and barstate.isconfirmed
+
+// 标记信号来源
+var string signalSource = ""
+if final_buy_signal
+    signalSource := final_long_breakout ? "突破" : "回踩"
+if final_sell_signal
+    signalSource := final_short_breakout ? "突破" : "回踩"
+
+// ==========================================
+// E. 信号强度分级（在信号触发时计算并保存）
+// ==========================================
+e_score = 0
+e_score += is_stable_uptrend or is_stable_downtrend ? 1 : 0
+e_score += structure_pass_long or structure_pass_short ? 1 : 0
+e_score += use_mtf_filter and (mtf_pass_long or mtf_pass_short) ? 1 : 0
+e_score += rsi14 > 50 and rsi14 < 70 ? 1 : 0
+e_score += long_pullback_depth == 2 or short_pullback_depth == 2 ? 1 : 0
+e_score += vol_pass ? 1 : 0
+e_score += lower_shadow_ratio > 0.5 or upper_shadow_ratio > 0.5 ? 1 : 0
+e_score += longBandReason == "短→中" or shortBandReason == "短→中" ? 1 : 0
+
+signal_grade = e_score >= 7 ? "S" : e_score >= 5 ? "A" : e_score >= 3 ? "B" : "C"
+grade_color  = e_score >= 7 ? color.lime : e_score >= 5 ? color.blue : e_score >= 3 ? color.orange : color.red
+
+// 在状态机确认信号时捕获等级
+if state_long == 2 and state_long[1] != 2
+    longSignalGrade := signal_grade
+
+if state_short == 2 and state_short[1] != 2
+    shortSignalGrade := signal_grade
+
+// ==========================================
+// C. 入场/SL/TP + 结构位
+// ==========================================
+var float longEntryP  = na
+var float longSLP     = na
+var float longRP      = na
+var float longTP1P    = na
+var float longTP2P    = na
+var float shortEntryP = na
+var float shortSLP    = na
+var float shortRP     = na
+var float shortTP1P   = na
+var float shortTP2P   = na
+var bool  longPending  = false
+var bool  shortPending = false
+
+var float longPullbackLow   = na
+var float shortPullbackHigh = na
+
+if long_trigger_short or long_trigger_medium
+    longPullbackLow := low
+
+if short_trigger_short or short_trigger_medium
+    shortPullbackHigh := high
+
+if final_buy_signal
+    longPending := true
+
+if final_sell_signal
+    shortPending := true
+
+if longPending
+    longEntryP  := open
+    struct_sl_l = use_structure_sl and not na(pl1) ? pl1 - atr14 * sl_cushion : -999999.0
+    longSLP := math.max(ema70, math.max(struct_sl_l, longPullbackLow - atr14 * sl_cushion))
+    longRP  := math.max(longEntryP - longSLP, atr14 * 0.1)
+    raw_tp1_l = longEntryP + longRP * final_risk1
+    raw_tp2_l = longEntryP + longRP * final_risk2
+    struct_tp_l = use_structure_tp and not na(ph1) ? ph1 : 999999.0
+    longTP1P := math.min(raw_tp1_l, struct_tp_l)
+    longTP2P := math.min(raw_tp2_l, struct_tp_l)
+    longPending := false
+
+if shortPending
+    shortEntryP := open
+    struct_sl_s = use_structure_sl and not na(ph1) ? ph1 + atr14 * sl_cushion : 999999.0
+    shortSLP := math.min(ema70, math.min(struct_sl_s, shortPullbackHigh + atr14 * sl_cushion))
+    shortRP  := math.max(shortSLP - shortEntryP, atr14 * 0.1)
+    raw_tp1_s = shortEntryP - shortRP * final_risk1
+    raw_tp2_s = shortEntryP - shortRP * final_risk2
+    struct_tp_s = use_structure_tp and not na(pl1) ? pl1 : -999999.0
+    shortTP1P := math.max(raw_tp1_s, struct_tp_s)
+    shortTP2P := math.max(raw_tp2_s, struct_tp_s)
+    shortPending := false
+
+long_just_entered  = not na(longEntryP)  and na(longEntryP[1])
+short_just_entered = not na(shortEntryP) and na(shortEntryP[1])
+
+// ==========================================
+// D. 分批出场 + 移动止损
+// ==========================================
+var float long_entry_price  = na
+var float long_high_tracker = na
+var float long_low_tracker  = na
+var int   long_bars_taken   = 0
+var float long_tracker_sl   = na
+var bool  long_tp1_hit      = false
+var bool  long_tp2_hit      = false
+var float long_trailing_sl  = na
+
+var float short_entry_price  = na
+var float short_high_tracker = na
+var float short_low_tracker  = na
+var int   short_bars_taken   = 0
+var float short_tracker_sl   = na
+var bool  short_tp1_hit      = false
+var bool  short_tp2_hit      = false
+var float short_trailing_sl  = na
+
+if long_just_entered
+    long_entry_price  := longEntryP
+    long_high_tracker := high
+    long_low_tracker  := low
+    long_bars_taken   := 0
+    long_tracker_sl   := longSLP
+    long_tp1_hit      := false
+    long_tp2_hit      := false
+    long_trailing_sl  := na
+
+if short_just_entered
+    short_entry_price  := shortEntryP
+    short_high_tracker := high
+    short_low_tracker  := low
+    short_bars_taken   := 0
+    short_tracker_sl   := shortSLP
+    short_tp1_hit      := false
+    short_tp2_hit      := false
+    short_trailing_sl  := na
+
+if not na(long_entry_price)
+    long_high_tracker := math.max(long_high_tracker, high)
+    long_low_tracker  := math.min(long_low_tracker, low)
+    long_bars_taken   += 1
+
+if not na(short_entry_price)
+    short_high_tracker := math.max(short_high_tracker, high)
+    short_low_tracker  := math.min(short_low_tracker, low)
+    short_bars_taken   += 1
+
+// D. TP1后移动止损到入场价
+if use_trailing and not na(long_entry_price) and not long_tp1_hit
+    if long_high_tracker >= long_entry_price + math.abs(long_entry_price - long_tracker_sl) * final_risk1
+        long_tp1_hit := true
+        long_trailing_sl := long_entry_price
+
+if use_trailing and not na(short_entry_price) and not short_tp1_hit
+    if short_low_tracker <= short_entry_price - math.abs(short_entry_price - short_tracker_sl) * final_risk1
+        short_tp1_hit := true
+        short_trailing_sl := short_entry_price
+
+// 结算条件（TP1后用移动止损代替原始止损）
+long_effective_sl = long_tp1_hit and use_trailing ? long_trailing_sl : long_tracker_sl
+short_effective_sl = short_tp1_hit and use_trailing ? short_trailing_sl : short_tracker_sl
+
+long_tp_triggered  = not na(long_entry_price) and long_high_tracker >= long_entry_price + math.abs(long_entry_price - long_tracker_sl) * final_risk1
+long_sl_triggered  = not na(long_entry_price) and low <= long_effective_sl
+long_window_done   = not na(long_entry_price) and long_bars_taken >= stat_window
+
+short_tp_triggered = not na(short_entry_price) and short_low_tracker <= short_entry_price - math.abs(short_entry_price - short_tracker_sl) * final_risk1
+short_sl_triggered = not na(short_entry_price) and high >= short_effective_sl
+short_window_done  = not na(short_entry_price) and short_bars_taken >= stat_window
+
+// ==========================================
+// 胜率统计
+// ==========================================
+var int   total_trades      = 0
+var int   win_trades        = 0
+var float sum_max_profit_r  = 0.0
+var float sum_max_loss_r    = 0.0
+
+if not na(long_entry_price) and (long_tp_triggered or long_sl_triggered or long_window_done)
+    r_size      = math.max(math.abs(long_entry_price - long_tracker_sl), atr14 * 0.1)
+    max_profit  = (long_high_tracker - long_entry_price) / r_size
+    max_loss    = (long_entry_price - long_low_tracker)  / r_size
+    total_trades += 1
+    if max_profit > max_loss
+        win_trades += 1
+    sum_max_profit_r += max_profit
+    sum_max_loss_r   += max_loss
+    long_entry_price  := na
+    long_high_tracker := na
+    long_low_tracker  := na
+    long_bars_taken   := 0
+    long_tracker_sl   := na
+    long_tp1_hit      := false
+    long_tp2_hit      := false
+    long_trailing_sl  := na
+    longEntryP        := na
+
+if not na(short_entry_price) and (short_tp_triggered or short_sl_triggered or short_window_done)
+    r_size      = math.max(math.abs(short_tracker_sl - short_entry_price), atr14 * 0.1)
+    max_profit  = (short_entry_price - short_low_tracker)  / r_size
+    max_loss    = (short_high_tracker - short_entry_price) / r_size
+    total_trades += 1
+    if max_profit > max_loss
+        win_trades += 1
+    sum_max_profit_r += max_profit
+    sum_max_loss_r   += max_loss
+    short_entry_price  := na
+    short_high_tracker := na
+    short_low_tracker  := na
+    short_bars_taken   := 0
+    short_tracker_sl   := na
+    short_tp1_hit      := false
+    short_tp2_hit      := false
+    short_trailing_sl  := na
+    shortEntryP        := na
+
+win_rate   = total_trades > 0 ? win_trades / total_trades * 100 : na
+avg_profit = total_trades > 0 ? sum_max_profit_r / total_trades : na
+avg_loss   = total_trades > 0 ? sum_max_loss_r   / total_trades : na
+
+// TP状态
+tp1_hit_any = long_tp1_hit or short_tp1_hit
+tp2_hit_any = long_tp2_hit or short_tp2_hit
+tp_status_text = tp2_hit_any ? "TP2✓" : tp1_hit_any ? "TP1✓保本" : (not na(long_entry_price) or not na(short_entry_price) ? "持仓中" : "—")
+tp_status_color = tp2_hit_any ? color.lime : tp1_hit_any ? color.green : (not na(long_entry_price) or not na(short_entry_price) ? color.orange : color.gray)
+
+// ==========================================
+// 信号箭头（区分回踩/突破）
+// ==========================================
+plotshape(final_buy_signal and signalSource == "回踩", style=shape.triangleup,   location=location.belowbar, color=color.new(color.blue,  0), size=size.tiny, title="买入·回踩", text="买入", textcolor=color.white)
+plotshape(final_sell_signal and signalSource == "回踩", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny, title="卖出·回踩", text="卖出", textcolor=color.white)
+plotshape(final_buy_signal and signalSource == "突破", style=shape.circle,   location=location.belowbar, color=color.new(color.blue,  0), size=size.tiny, title="买入·突破", text="突破买", textcolor=color.white)
+plotshape(final_sell_signal and signalSource == "突破", style=shape.circle, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny, title="卖出·突破", text="突破卖", textcolor=color.white)
+
+// ==========================================
+// 信息卡
+// ==========================================
+var string longReason = ""
+var string shortReason = ""
+
+if final_buy_signal
+    entryApprox = close
+    struct_sl_approx = use_structure_sl and not na(pl1) ? pl1 - atr14 * sl_cushion : -999999.0
+    slApprox = math.max(ema70, math.max(struct_sl_approx, longPullbackLow - atr14 * sl_cushion))
+    rpApprox = math.max(entryApprox - slApprox, atr14 * 0.1)
+    raw_t1 = entryApprox + rpApprox * final_risk1
+    raw_t2 = entryApprox + rpApprox * final_risk2
+    // 结构位止盈：只在阻力位高于入场价时才用（做多的TP必须在入场上方）
+    struct_tp_approx = use_structure_tp and not na(ph1) and ph1 > entryApprox ? ph1 : 999999.0
+    tp1Approx = math.min(raw_t1, struct_tp_approx)
+    tp2Approx = math.min(raw_t2, struct_tp_approx)
+    longReason := (signalSource == "突破" ? "突破" : longBandReason) + " [" + longSignalGrade + "]"
+    label.new(bar_index, low - atr14 * (0.5 + longLabelOffset),
+         "买·" + longReason + "\n" + str.tostring(entryApprox, format.mintick) + "\nS " + str.tostring(slApprox, format.mintick) + "\nT1 " + str.tostring(tp1Approx, format.mintick) + "\nT2 " + str.tostring(tp2Approx, format.mintick),
+         style=label.style_label_up, color=color.new(color.blue, 20), textcolor=color.white, size=size.normal)
+    longLabelOffset += 1
+
+if final_sell_signal
+    entryApprox = close
+    struct_sl_approx = use_structure_sl and not na(ph1) ? ph1 + atr14 * sl_cushion : 999999.0
+    slApprox = math.min(ema70, math.min(struct_sl_approx, shortPullbackHigh + atr14 * sl_cushion))
+    rpApprox = math.max(slApprox - entryApprox, atr14 * 0.1)
+    raw_t1s = entryApprox - rpApprox * final_risk1
+    raw_t2s = entryApprox - rpApprox * final_risk2
+    // 结构位止盈：只在支撑位低于入场价时才用（做空的TP必须在入场下方）
+    struct_tp_approx = use_structure_tp and not na(pl1) and pl1 < entryApprox ? pl1 : -999999.0
+    tp1Approx = math.max(raw_t1s, struct_tp_approx)
+    tp2Approx = math.max(raw_t2s, struct_tp_approx)
+    shortReason := (signalSource == "突破" ? "突破" : shortBandReason) + " [" + shortSignalGrade + "]"
+    label.new(bar_index, high + atr14 * (0.5 + shortLabelOffset),
+         "卖·" + shortReason + "\n" + str.tostring(entryApprox, format.mintick) + "\nS " + str.tostring(slApprox, format.mintick) + "\nT1 " + str.tostring(tp1Approx, format.mintick) + "\nT2 " + str.tostring(tp2Approx, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.normal)
+    shortLabelOffset += 1
+
+// ==========================================
+// 信息面板
+// ==========================================
+var table infoTable = na
+
+if barstate.islast
+    infoTable := table.new(position.top_right, 2, 13, bgcolor=color.new(color.black, 10), border_width=2, border_color=color.new(color.white, 30))
+    
+    table.cell(infoTable, 0, 0, "DPB v6.0",         text_color=color.new(color.white, 0),  text_size=size.large)
+    table.cell(infoTable, 1, 0, syminfo.tickerid,    text_color=color.new(color.white, 50), text_size=size.normal)
+    
+    table.cell(infoTable, 0, 1, "周期",              text_color=color.new(color.white, 20), text_size=size.normal)
+    styleText = tfMin <= 15 ? "超短线" : tfMin <= 60 ? "短线" : tfMin <= 240 ? "波段" : "长线"
+    styleColor = tfMin <= 15 ? color.aqua : tfMin <= 60 ? color.blue : tfMin <= 240 ? color.orange : color.purple
+    table.cell(infoTable, 1, 1, timeframe.period + " (" + styleText + ")", text_color=styleColor, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 2, "趋势",              text_color=color.new(color.white, 20), text_size=size.normal)
+    trendText = is_uptrend ? "多头" : is_downtrend ? "空头" : "震荡"
+    trendColor = is_uptrend ? color.lime : is_downtrend ? color.red : color.orange
+    table.cell(infoTable, 1, 2, trendText,           text_color=trendColor, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 3, "价格结构",          text_color=color.new(color.white, 20), text_size=size.normal)
+    structText = structure_long ? "HH+HL✓" : structure_short ? "LH+LL✓" : "无结构"
+    structColor = structure_long or structure_short ? color.lime : color.gray
+    table.cell(infoTable, 1, 3, structText,          text_color=structColor, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 4, "最近信号",          text_color=color.new(color.white, 20), text_size=size.normal)
+    lastSigText = long_just_entered ? "买入" : short_just_entered ? "卖出" : "暂无"
+    lastSigColor = long_just_entered ? color.blue : short_just_entered ? color.red : color.gray
+    table.cell(infoTable, 1, 4, lastSigText,         text_color=lastSigColor, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 5, "────────────────",  text_color=color.new(color.white, 60), text_size=size.tiny)
+    table.cell(infoTable, 1, 5, "────────────────",  text_color=color.new(color.white, 60), text_size=size.tiny)
+    
+    table.cell(infoTable, 0, 6,  "TP盈亏比",         text_color=color.new(color.white, 20), text_size=size.normal)
+    tpRatioText = str.tostring(final_risk1, "#.#") + " / " + str.tostring(final_risk2, "#.#")
+    table.cell(infoTable, 1, 6,  tpRatioText,        text_color=color.new(color.white, 0),  text_size=size.normal)
+    
+    table.cell(infoTable, 0, 7,  "历史胜率",         text_color=color.new(color.white, 20), text_size=size.normal)
+    winRateText = not na(win_rate) ? str.tostring(win_rate, "#.#") + "%" : "—"
+    winRateColor = not na(win_rate) ? (win_rate >= 60 ? color.lime : win_rate >= 45 ? color.orange : color.red) : color.gray
+    table.cell(infoTable, 1, 7,  winRateText,        text_color=winRateColor, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 8,  "总样本",           text_color=color.new(color.white, 20), text_size=size.normal)
+    table.cell(infoTable, 1, 8,  str.tostring(total_trades), text_color=color.new(color.white, 0), text_size=size.normal)
+    
+    table.cell(infoTable, 0, 9,  "平均浮盈",         text_color=color.new(color.white, 20), text_size=size.normal)
+    avgProfitText = not na(avg_profit) ? str.tostring(avg_profit, "#.#") + "R" : "—"
+    table.cell(infoTable, 1, 9,  avgProfitText,      text_color=color.lime, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 10, "平均浮亏",         text_color=color.new(color.white, 20), text_size=size.normal)
+    avgLossText = not na(avg_loss) ? str.tostring(avg_loss, "#.#") + "R" : "—"
+    table.cell(infoTable, 1, 10, avgLossText,        text_color=color.red, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 11, "信号等级",         text_color=color.new(color.white, 20), text_size=size.normal)
+    table.cell(infoTable, 1, 11, signal_grade + " (" + str.tostring(e_score) + "/8)", text_color=grade_color, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 12, "TP状态",          text_color=color.new(color.white, 20), text_size=size.normal)
+    table.cell(infoTable, 1, 12, tp_status_text,    text_color=tp_status_color, text_size=size.normal)
+
+// ==========================================
+// 警报（回踩+突破）
+// ==========================================
+alertcondition(final_buy_signal and signalSource == "回踩",  "[DPB] 买入·回踩", "二次回踩买入")
+alertcondition(final_sell_signal and signalSource == "回踩", "[DPB] 卖出·回踩", "二次回踩卖出")
+alertcondition(final_buy_signal and signalSource == "突破",  "[DPB] 买入·突破", "突破模式买入")
+alertcondition(final_sell_signal and signalSource == "突破", "[DPB] 卖出·突破", "突破模式卖出")
