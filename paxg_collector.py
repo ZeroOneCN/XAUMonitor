@@ -57,6 +57,9 @@ SIGNALS_DB = BASE / "signals.db"             # 复用监控的信号库
 FIRED_FILE = BASE / "paxg_fired.json"        # 已触发价位记录（持久化，避免重启后重发）
 LEVEL_RELOAD_SECS = 60                       # 重新加载监控价位的间隔
 MAINTAIN_SECS = 86400                        # 数据库归档自维护间隔（每日一次）
+# PAXG↔XAU 价差修正（见 _paxg_basis 说明：两个市场的价格不能直接比）
+BASIS_TTL_SEC = 600                          # 价差基准缓存 10 分钟（价差移动很慢，省额度）
+_basis_cache = {"t": 0.0, "key": "", "val": None}
 LEVEL_MAX_SIGNALS = 20                       # 最多盯最近多少条信号
 DEFAULT_ALERT_MAX_AGE_H = 24                 # 信号超过多少小时不再盯（兜底）
 
@@ -80,35 +83,88 @@ _LEVEL_TTL_MINUTES = {
 # 实测事故：17:01:18 报「触发止损 4388.89」，当时 PAXG=4388.78，而真实
 # XAU/USD 最低 4392.32，离止损还差 3.24 美元；那一分钟的 PAXG 只有 3 笔成交。
 # 结果是用户收到假止损提醒（可能因此平掉好单）。
-# 所以触发前必须用「与信号同源」的行情复核一次。
-_xau_cache = {"t": 0.0, "df": None, "fail": 0}
+# 【注意】曾试过「PAXG 穿越后要 XAU 也确认」的二元门 —— 那会造成【漏报】：
+#   PAXG 因价差先穿越并被跳过，之后它一直在价位下方、不再产生「穿越事件」，
+#   真实 XAU 后续到达该位时就永远不会报警。实测 #17 的止损：
+#   PAXG 17:00 就跌破 4388.89，XAU 直到 17:28 才到 —— 领先 28 分钟，
+#   于是 17:28 的真止损被永久静默。
+# 正确解法是连续修正价差（见 _paxg_basis），而不是二元拦截。
 
 
-def _xau_confirm(kind: str, level: float, direction: int, lookback_min: int = 3) -> bool:
-    """用真实 XAU/USD 复核本次穿越。无法复核时返回 True（放行，宁可多报不漏报）。"""
+def _paxg_basis(cfg: dict, lookback_min: int = 30, db_path=None):
+    """PAXG 与真实 XAU/USD 的价差（XAU − PAXG），取近期中位数。
+
+    【为什么必须修正价差，而不是加「确认门」】
+    我们两次都栽在这里，是两个反向的错：
+      ① 最初直接用 PAXG 价格去比「用 XAU 算出来的止损位」
+         → PAXG 系统性低于 XAU（实测常态 ~$2-3，稀薄时插针到 $6+），
+           价格跌向止损时 PAXG 永远先穿越 → 误报止损（17:01 那次）。
+      ② 我改成「PAXG 穿越后要 XAU 也确认才报」→ 变成漏报：
+         PAXG 在 17:00 就跌破 4388.89，XAU 直到 17:28 才到（领先 28 分钟）。
+         17:00 那次被正确跳过，但 PAXG 此后一直在价位下方、
+         不再产生「穿越事件」→ 17:28 的真止损被永久静默。
+
+    两次的同一个病根都是：**拿不同市场的价格当同一把尺子**。
+    正确解法是先把 PAXG 换算成「XAU 等价价」，再比较 —— 连续修正而非二元拦截，
+    既不会因价差而提前触发，也不会因「已经穿过」而丢失后续的真实穿越。
+
+    返回价差（美元）；数据不足时返回 None。
+    """
     now = time.time()
-    if _xau_cache["df"] is None or (now - _xau_cache["t"]) > 60:
-        try:
-            import dpb_monitor as mon           # 与信号引擎同源，保证口径一致
-            cfg = mon.load_config()
-            _xau_cache["df"] = mon.fetch_data(cfg.get("ticker_td", "XAU/USD"), "1m", "1min")
-            _xau_cache["t"] = now
-            _xau_cache["fail"] = 0
-        except Exception as e:
-            _xau_cache["fail"] += 1
-            log.warning(f"[做单] XAU/USD 复核取数失败({e}) → 本次按 PAXG 放行")
-            return True
+    key = f"basis:{lookback_min}"
+    if (_basis_cache["key"] == key and _basis_cache["val"] is not None
+            and now - _basis_cache["t"] < BASIS_TTL_SEC):
+        return _basis_cache["val"]
     try:
-        recent = _xau_cache["df"].tail(max(1, int(lookback_min)))
-        lo, hi = float(recent["Low"].min()), float(recent["High"].max())
+        import dpb_monitor as mon
+        mcfg = mon.load_config()
+        xau = mon.fetch_data(mcfg["ticker_td"], "1m", "1min")
+        if xau is None or len(xau) < 5:
+            return None
+    except Exception as e:
+        log.warning(f"[做单] 价差基准取 XAU 失败: {e}")
+        return None
+    db = Path(db_path) if db_path else DEFAULT_DB
+    if not db.exists():
+        return None
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            rows = conn.execute(
+                "SELECT open_ms, close FROM klines_1m WHERE closed = 1"
+                " ORDER BY open_ms DESC LIMIT ?", (lookback_min + 5,)).fetchall()
     except Exception:
-        return True
-
-    if kind == "止损":
-        return (lo <= level) if direction > 0 else (hi >= level)
-    if kind in ("TP1", "TP2"):
-        return (hi >= level) if direction > 0 else (lo <= level)
-    return lo <= level <= hi                    # 入场位：真实价格是否到过
+        return None
+    if len(rows) < 5:
+        return None
+    # 【易错点】必须用「本地时间字符串」对齐，不能用 Timestamp.timestamp()。
+    # Twelve Data 返回的索引是【无时区的本地时间】，而 timestamp() 会把它当 UTC，
+    # 于是整体错位 8 小时 —— 实测会算出 -26 美元的荒谬价差（拿 8 小时前的 PAXG 配对）。
+    # 两边都用 "%Y-%m-%d %H:%M" 字符串做键，天然绕开时区换算。
+    paxg = {}
+    for ms, c in rows:
+        if c:
+            paxg[datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")] = float(c)
+    diffs = []
+    for ts, row in xau.iterrows():
+        try:
+            base = ts
+            for off in (0, -1, 1):          # 容忍 ±1 分钟的边界偏差
+                k = (base + timedelta(minutes=off)).strftime("%Y-%m-%d %H:%M")
+                if k in paxg:
+                    v = float(row["Close"]) - paxg[k]
+                    if -50 < v < 50:        # 明显异常值丢弃
+                        diffs.append(v)
+                    break
+        except Exception:
+            continue
+    if len(diffs) < 5:
+        return None
+    diffs.sort()
+    basis = diffs[len(diffs) // 2]        # 中位数
+    _basis_cache.update({"t": now, "key": key, "val": basis})
+    log.info(f"[做单] PAXG 价差基准 = {basis:+.2f} 美元"
+             f"（XAU − PAXG，{len(diffs)} 分钟样本，中位数）")
+    return basis
 
 
 def _trigger_dir(kind: str, direction: int) -> int:
@@ -325,10 +381,11 @@ class LevelWatcher:
         self.db_path = Path(db_path) if db_path else DEFAULT_DB
         self.last_maintain = 0.0        # 0 → 启动后第一轮就做一次自维护，之后每日一次
         self.max_age_h = max_age_h
-        # 触发前是否用真实 XAU/USD 复核（防 PAXG 独立插针误报）
+        # 价差修正取不到时的告警只报一次，避免刷屏
+        self._basis_warned = False
+        # 触发前是否用真实 XAU/USD 修正 PAXG 价差（false = 直接用 PAXG，会有 $2-3 系统性偏差）
         self.confirm_xau = confirm_xau
         self.confirm_lookback_min = confirm_lookback_min
-        self._false_logged = set()
         self.levels = []
         self.fired = self._load_fired()
         self.prev = None
@@ -438,7 +495,23 @@ class LevelWatcher:
         if self.prev is None:
             self.prev = price
             return
-        p0, p1 = self.prev, price
+        # 【关键】把 PAXG 价格换算成「XAU 等价价」后再与信号价位比较。
+        # 不修正 → PAXG 因价差提前穿越，误报止损；
+        # 改成「要 XAU 确认」的二元门 → PAXG 先穿越后永久静默，漏报止损。
+        # 只有连续修正价差，两侧才是同一把尺子（详见 _paxg_basis 说明）。
+        basis = 0.0
+        if self.confirm_xau and self.levels:      # 没有价位要盯时不必消耗额度
+            cfg_now = _load_cfg()
+            b = _paxg_basis(cfg_now, int(cfg_now.get("paxg_confirm_lookback_min", 30)),
+                               self.db_path)
+            if b is None:
+                b = float(cfg_now.get("paxg_basis_fallback", 2.0))
+                if not self._basis_warned:
+                    self._basis_warned = True
+                    log.warning(f"[做单] 实时价差取不到，暂用兜底值 {b:+.2f} 美元"
+                                f"（恢复正常前可能偏差）")
+            basis = b
+        p0, p1 = self.prev + basis, price + basis
         for l in self.levels:
             if l["id"] in self.fired:
                 continue
@@ -452,18 +525,9 @@ class LevelWatcher:
             want = l.get("dir", 0)
             if want and crossed != want:
                 continue           # 方向不符：做多的止盈不会在「下穿」时被触及
-            # PAXG 独立插针复核：真实 XAU/USD 没到就不报（否则会误报止损/止盈）
-            if self.confirm_xau and not _xau_confirm(
-                    l["kind"], p, l.get("direction", 1), self.confirm_lookback_min):
-                if l["id"] not in self._false_logged:
-                    self._false_logged.add(l["id"])
-                    log.warning(
-                        f"[做单] 忽略 PAXG 假穿越: {l['kind']} @ {p:.2f} "
-                        f"(PAXG 现价 {price:.2f}, 真实 XAU/USD 未确认)")
-                continue
             self.fired.add(l["id"])
             self._save_fired()          # 落盘，重启后不会重发
-            self._alert(l, price)
+            self._alert(l, price + basis)
         self.prev = price
 
     def _alert(self, l: dict, price: float):

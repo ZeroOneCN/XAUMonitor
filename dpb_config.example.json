@@ -106,5 +106,7 @@
   "use_paxg_volume": true,
   "paxg_volume_min_bars": 5,
   "paxg_trades_retention_days": 30,
-  "paxg_klines_retention_days": 180
+  "paxg_klines_retention_days": 180,
+  "paxg_confirm_lookback_min": 30,
+  "paxg_basis_fallback": 2.0
 }
