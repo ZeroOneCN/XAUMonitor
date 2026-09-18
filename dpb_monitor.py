@@ -1653,6 +1653,28 @@ def outcome_stats(db_file: str) -> dict:
 # ============================================================
 # B9 状态快照（供 Web 仪表盘读取，避免仪表盘重复消耗 API 配额）
 # ============================================================
+# ============================================================
+# 心跳（供外部看门狗判断「监控是否还活着」）
+# ============================================================
+# 为什么必须有：tg-monitor 出过事故——进程活着、systemd 显示已在线 18 小时，
+# 但内部循环早已静默卡死 3.5 小时，没有任何告警，用户白白丢数据。
+# 这里每轮成功结束就刷一次心跳，由独立的看门狗（watchdog.py + systemd timer）
+# 检查新鲜度，卡死/服务掉了都能立刻推送告警。
+_HEARTBEAT_MEM = {"last": None}
+
+
+def write_heartbeat(cfg: dict, extra: str = ""):
+    """刷新心跳时间戳（内存 + 落盘）"""
+    now = datetime.now()
+    _HEARTBEAT_MEM["last"] = now
+    try:
+        p = _state_path(cfg.get("heartbeat_file", "dpb_heartbeat.txt"))
+        p.write_text(now.strftime("%Y-%m-%d %H:%M:%S") + (" | " + extra if extra else ""),
+                     encoding="utf-8")
+    except Exception as e:
+        log.error(f"[心跳] 写入失败: {e}")
+
+
 def _write_status(cfg: dict, results: dict):
     """把各周期最新状态写入 JSON 快照"""
     try:
@@ -2029,6 +2051,7 @@ def main():
                 save_state(cfg["state_file"], state)
                 # 结果追踪：评估已推送信号的实际结果（验证闭环的地基，复用上面的数据 → 零额外消耗）
                 evaluate_outcomes(cfg, df_cache=df_cache)
+                write_heartbeat(cfg, f"周期={interval // 60}分钟")
                 st = outcome_stats(cfg.get("db_file", "signals.db"))
                 if st.get("closed"):
                     log.info(

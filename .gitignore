@@ -22,3 +22,6 @@ __pycache__/
 .venv/
 venv/paxg_fired.json
 news_calendar.json
+dpb_heartbeat.txt
+watchdog_state.json
+watchdog.log

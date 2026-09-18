@@ -100,5 +100,7 @@
   ],
   "news_blackout_before_min": 30,
   "news_blackout_after_min": 30,
-  "news_manual_blackouts": []
+  "news_manual_blackouts": [],
+  "watchdog_auto_restart": true,
+  "heartbeat_file": "dpb_heartbeat.txt"
 }
