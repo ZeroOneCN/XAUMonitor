@@ -27,3 +27,4 @@ watchdog_state.json
 watchdog.log
 backtest_cache/
 backtest_full.log
+backtest_1d.log

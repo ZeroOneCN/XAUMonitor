@@ -46,7 +46,7 @@ TF_SPEC = {
     "15m": {"interval": "15min", "days": 180},
     "1h":  {"interval": "1h",    "days": 730},
     "4h":  {"interval": "4h",    "days": 1825},
-    "1d":  {"interval": "1d",    "days": 3650},
+    "1d":  {"interval": "1day", "days": 7300},
 }
 MAX_PAGES = 12                    # 每个周期最多翻多少页，防跑飞
 WARMUP_BARS = 220                 # 跳过前期指标未成形的K线（ema70 等）
