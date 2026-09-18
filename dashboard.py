@@ -90,7 +90,7 @@ def api_signals(limit: int = 60):
     rows = _query(
         "SELECT s.id, s.ts, s.pushed_at, s.timeframe, s.direction, s.sig_type, s.grade, s.score,"
         " s.band, s.entry, s.sl, s.tp1, s.tp2, s.rsi, s.atr, s.resonance,"
-        " o.outcome, o.r_multiple"
+        " o.outcome, o.r_multiple, o.resolved_at"
         " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
         " ORDER BY s.id DESC LIMIT ?",
         (int(limit),),
@@ -102,15 +102,17 @@ def api_signals(limit: int = 60):
 def api_outcomes():
     """结果追踪统计：胜率 / 期望值 / 盈亏因子（做单策略的验证闭环）"""
     rows = _query(
-        "SELECT o.outcome, o.r_multiple, o.bars, o.mfe, o.mae,"
+        "SELECT o.outcome, o.r_multiple, o.bars, o.mfe, o.mae, o.resolved_at,"
         " s.grade, s.sig_type, s.timeframe, s.direction, s.id"
         " FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id"
         " ORDER BY s.id"
     )
-    closed = [r for r in rows if r["outcome"] in ("SL", "TP1", "TP2")]
+    # 判据必须是 resolved_at（真正结案），不能只看 outcome：
+    # TP1 已到但未到 TP2、窗口也没走满时，单子还在跑，仍属追踪中。
+    closed = [r for r in rows if r["resolved_at"]]
     open_n = len(rows) - len(closed)
     if not closed:
-        return {"closed": 0, "open": open_n, "win_rate": None, "expectancy_r": None,
+        return {"closed": 0, "tracking": open_n, "win_rate": None, "expectancy_r": None,
                 "profit_factor": None, "total_r": 0.0, "wins": 0, "losses": 0,
                 "by_grade": {}, "by_type": {}, "by_timeframe": {}, "recent": []}
 
@@ -133,7 +135,7 @@ def api_outcomes():
     recent = [dict(r) for r in closed][-20:][::-1]
     return {
         "closed": len(closed),
-        "open": open_n,
+        "tracking": open_n,
         "wins": len(wins),
         "losses": len(closed) - len(wins),
         "win_rate": len(wins) / len(closed) * 100,
@@ -324,7 +326,9 @@ async function load(){
     const ow = document.getElementById('outCards'); ow.innerHTML='';
     const od = document.getElementById('outDetail'); od.textContent='';
     if(!oc.closed){
-      od.textContent = `暂无已结案信号（追踪中 ${oc.open||0} 笔）— 需价格先触及 SL 或 TP 才会有结果`;
+      const mk=(l,v)=>{const c=E('div','card');c.appendChild(E('div','v',v));c.appendChild(E('div','l',l));ow.appendChild(c);};
+      mk('已结案', 0); mk('追踪中', oc.tracking||0);
+      od.textContent = `暂无已结案信号（追踪中 ${oc.tracking||0} 笔）— 需先触及 SL/TP，或追踪窗口走满才算结案`;
     } else {
       const cards2 = [
         ['胜率', oc.win_rate.toFixed(1)+'%', ''],
@@ -332,12 +336,13 @@ async function load(){
         ['累计R', (oc.total_r>=0?'+':'')+oc.total_r.toFixed(2)+'R', ''],
         ['盈亏因子', oc.profit_factor==null?'∞':oc.profit_factor.toFixed(2), ''],
         ['已结案', oc.closed, ''],
-        ['追踪中', oc.open||0, ''],
+        ['追踪中', oc.tracking||0, ''],
       ];
       cards2.forEach(([l,v])=>{const c=E('div','card');c.appendChild(E('div','v',v));c.appendChild(E('div','l',l));ow.appendChild(c);});
       const agg=(obj,label)=>{const ks=Object.keys(obj||{});if(!ks.length)return '';
         return ` · ${label}: `+ks.map(k=>`${k} ${obj[k].wins}/${obj[k].n}(${obj[k].r>=0?'+':''}${obj[k].r.toFixed(1)}R)`).join('  ');};
-      od.textContent = `胜 ${oc.wins} / 负 ${oc.losses}`
+      const oc2 = oc.by_outcome ? ' · 结局: '+Object.entries(oc.by_outcome).map(([k,v])=>`${k} ${v}`).join('  ') : '';
+      od.textContent = `胜 ${oc.wins} / 负 ${oc.losses} · 追踪中 ${oc.tracking||0}` + oc2
         + agg(oc.by_grade,'按等级') + agg(oc.by_type,'按类型') + agg(oc.by_timeframe,'按周期');
     }
 
@@ -365,12 +370,18 @@ async function load(){
       if(s.sig_type) top.appendChild(E('span','muted', s.sig_type));
       if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/10')));
       if(s.resonance>=2) top.appendChild(E('span','fire','🔥共振'+s.resonance));
-      // 每条信号直接显示当前结果，不用去别处找
+      // 每条信号直接显示当前结果。注意区分「已结案」与「追踪中」：
+      // TP1 已到但还没到 TP2、窗口也未走满时，单子还在跑，不能算已结案。
       if(s.outcome){
-        const [txt,col] = OUT[s.outcome] || [s.outcome,'#9aa7b6'];
+        const base = OUT[s.outcome] || [s.outcome,'#9aa7b6'];
+        let txt, col;
+        if(s.outcome==='open'){ txt='⏳ 追踪中'; col='#e3b341'; }
+        else if(!s.resolved_at){ txt='👀 '+base[0]+'·追踪中'; col='#e3b341'; }
+        else { txt=base[0]; col=base[1]; }
         const rr = (s.r_multiple!=null) ? ` ${s.r_multiple>=0?'+':''}${Number(s.r_multiple).toFixed(2)}R` : '';
         const bd = E('span',null,txt+rr);
         bd.style.cssText = `font-weight:800;font-size:13px;color:${col}`;
+        if(!s.resolved_at && s.outcome!=='open') bd.title='TP1 已到但未到 TP2，窗口未走满，仍在追踪';
         top.appendChild(bd);
       }
       top.appendChild(E('span','time', s.pushed_at||''));

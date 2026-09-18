@@ -113,6 +113,10 @@ def load_config():
         "adx_len": 14,
         "min_adx": 20,                 # 评分要求的最低 ADX（<20 视为震荡）
         "min_adx_filter": 0,           # >0 时作为硬门槛：ADX 低于该值直接不推送
+        # 结果追踪 / 分批止盈模型
+        "tp1_exit_pct": 0.5,           # TP1 了结的仓位比例，其余留到 TP2
+        "be_after_tp1": True,          # TP1 后止损是否移到保本（剩余仓位按 0R 计）
+        "outcome_max_bars": {},        # 各周期扫描窗口(根)，{} 用内置按周期默认
         # 各周期行情刷新间隔（分钟），省 API 额度；设为 {} 用内置默认
         "fetch_ttl_minutes": {},       # 例 {"5m":4,"15m":8,"1h":15,"4h":30,"1d":60}
     }
@@ -1368,11 +1372,33 @@ def _r_of(price: float, entry: float, r_size: float, direction: int) -> float:
     return (price - entry) * direction / r_size if r_size else 0.0
 
 
-def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars):
+# 各周期的结果追踪扫描窗口（根K线）。窗口走满才允许把「TP1 已到但未到 TP2」
+# 的单子结案；窗口没走满就继续挂着追踪，否则会把还在跑的单子提前锁死。
+_OUTCOME_MAX_BARS = {
+    "5m": 288,    # 24 小时
+    "15m": 96,    # 24 小时
+    "1h": 72,     # 3 天
+    "4h": 30,     # 5 天
+    "1d": 14,
+}
+
+
+def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars, cfg=None):
     """在信号之后的 K 线里逐根扫描，判断先碰止损还是止盈。
 
     保守原则：同一根 K 线内同时触及 SL 与 TP 时，按「先止损」处理
     （避免高估胜率——回测里最常见的自欺来源）。
+
+    分批止盈模型（tp1_exit_pct 默认 0.5 = TP1 平一半，之后止损移到保本）：
+      只碰 SL               → SL，-1.00R
+      TP1 后碰 TP2          → TP2，+1.50R（0.5×1 + 0.5×2）
+      TP1 后碰 SL(保本)      → TP1，+0.50R（0.5×1 + 0.5×0）
+      TP1 后窗口走完未再触发  → TP1，+0.50R（剩余按保本离场计）
+
+    关键：`done` 表示是否**真正结案**。只有终局事件发生、或扫描窗口走满
+    （len(bars) >= max_bars）才算结案；否则返回 done=False 继续追踪。
+    早期版本只要碰到 TP1 就立刻结案——哪怕当时只有 3 根 K 线——
+    结果单子还在跑却已锁死在 TP1，之后到了 TP2 也永远记不到。
     """
     long = direction > 0
     try:
@@ -1387,7 +1413,18 @@ def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars):
         return None          # 信号太新，数据里还没有它之后的 K 线
     bars = df.iloc[idx + 1: idx + 1 + max_bars]
     if bars.empty:
-        return {"outcome": "open", "r": 0.0, "bars": 0, "mfe": 0.0, "mae": 0.0}
+        return {"outcome": "open", "r": 0.0, "bars": 0,
+                "mfe": 0.0, "mae": 0.0, "done": False}
+
+    cfg = cfg or {}
+    pct = float(cfg.get("tp1_exit_pct", 0.5))          # TP1 了结的仓位比例
+    be = bool(cfg.get("be_after_tp1", True))            # TP1 后止损是否移到保本
+    r1 = _r_of(tp1, entry, r_size, direction)
+    r2 = _r_of(tp2, entry, r_size, direction)
+
+    def blend(rest_r: float) -> float:
+        """TP1 部分止盈 + 剩余仓位的综合 R 倍数"""
+        return pct * r1 + (1 - pct) * rest_r
 
     tp1_hit = False
     mfe = mae = 0.0
@@ -1401,21 +1438,25 @@ def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars):
         # 1) 先看止损（保守）
         if (long and lo <= sl) or ((not long) and hi >= sl):
             if tp1_hit:
-                return {"outcome": "TP1", "r": _r_of(tp1, entry, r_size, direction),
-                        "bars": n, "mfe": mfe, "mae": mae}
-            return {"outcome": "SL", "r": -1.0, "bars": n, "mfe": mfe, "mae": mae}
-        # 2) TP2
+                # TP1 之后才回撤：剩余仓位按「止损已移到保本」计 0R
+                return {"outcome": "TP1", "r": blend(0.0 if be else -1.0),
+                        "bars": n, "mfe": mfe, "mae": mae, "done": True}
+            return {"outcome": "SL", "r": -1.0, "bars": n,
+                    "mfe": mfe, "mae": mae, "done": True}
+        # 2) TP2（能到 TP2 必然已越过 TP1，仓位已是一半）
         if (long and hi >= tp2) or ((not long) and lo <= tp2):
-            return {"outcome": "TP2", "r": _r_of(tp2, entry, r_size, direction),
-                    "bars": n, "mfe": mfe, "mae": mae}
-        # 3) TP1（先记达标，继续扫描看能否到 TP2）
+            return {"outcome": "TP2", "r": blend(r2), "bars": n,
+                    "mfe": mfe, "mae": mae, "done": True}
+        # 3) TP1（先记达标，继续扫描看能否到 TP2 / 是否回撤）
         if (long and hi >= tp1) or ((not long) and lo <= tp1):
             tp1_hit = True
 
     if tp1_hit:
-        return {"outcome": "TP1", "r": _r_of(tp1, entry, r_size, direction),
-                "bars": len(bars), "mfe": mfe, "mae": mae}
-    return {"outcome": "open", "r": 0.0, "bars": len(bars), "mfe": mfe, "mae": mae}
+        # 窗口真正走满才算结案，否则继续追踪（可能还要到 TP2）
+        return {"outcome": "TP1", "r": blend(0.0), "bars": len(bars),
+                "mfe": mfe, "mae": mae, "done": len(bars) >= max_bars}
+    return {"outcome": "open", "r": 0.0, "bars": len(bars),
+            "mfe": mfe, "mae": mae, "done": False}
 
 
 def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> dict:
@@ -1437,7 +1478,9 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
             rows = conn.execute(
                 "SELECT s.id, s.timeframe, s.direction, s.entry, s.sl, s.tp1, s.tp2, s.r_size, s.ts"
                 " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
-                " WHERE (o.signal_id IS NULL OR o.outcome = 'open') AND s.pushed_at >= ?"
+                # 未结案的都要继续追踪：除 open 外，TP1 也可能还在往 TP2 走，
+                # 所以判据是 resolved_at 为空，而不是 outcome='open'
+                " WHERE (o.signal_id IS NULL OR o.resolved_at IS NULL) AND s.pushed_at >= ?"
                 " ORDER BY s.id", (cutoff,)
             ).fetchall()
     except Exception as e:
@@ -1453,6 +1496,7 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
 
     stats = {"open": 0, "SL": 0, "TP1": 0, "TP2": 0}
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mb_cfg = cfg.get("outcome_max_bars") or _OUTCOME_MAX_BARS
 
     for tf, sigs in by_tf.items():
         params = (cfg.get("timeframes") or {}).get(tf)
@@ -1471,14 +1515,17 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
 
         for (sid, _tf, direction, entry, sl, tp1, tp2, r_size, ts) in sigs:
             try:
-                res = _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars)
+                res = _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts,
+                                    int(mb_cfg.get(tf, max_bars)), cfg)
             except Exception as e:
                 log.error(f"[追踪] 信号#{sid} 评估失败: {e}")
                 continue
             if not res:
                 continue
             stats[res["outcome"]] = stats.get(res["outcome"], 0) + 1
-            resolved = None if res["outcome"] == "open" else now_s
+            # 只有「真正结案」才写 resolved_at；TP1 未到 TP2 且窗口没走满时
+            # 仍然挂为追踪中，这样之后到了 TP2 还能把结果升级上去
+            resolved = now_s if res.get("done") else None
             try:
                 with sqlite3.connect(_db_path(db_file)) as conn:
                     conn.execute(
@@ -1504,21 +1551,30 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
 
 
 def outcome_stats(db_file: str) -> dict:
-    """汇总已结案信号的胜率与期望值（供仪表盘/日志复盘）"""
+    """汇总已结案信号的胜率与期望值（供仪表盘/日志复盘）
+
+    只统计 `resolved_at` 已落地的单子。仍在追踪的（open / TP1 未到 TP2）
+    单独计入 tracking，不混进胜率——否则「还在跑的单子」会被算成输赢，
+    数字就不可信了。
+    """
     try:
         with sqlite3.connect(_db_path(db_file)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT o.outcome, o.r_multiple, o.bars, s.grade, s.sig_type, s.timeframe"
                 " FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id"
-                " WHERE o.outcome IN ('SL','TP1','TP2')"
+                " WHERE o.resolved_at IS NOT NULL"
             ).fetchall()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM signal_outcomes WHERE resolved_at IS NULL"
+            ).fetchone()
+            tracking = int(row[0]) if row else 0
     except Exception as e:
         log.error(f"[统计] 读取失败: {e}")
         return {"closed": 0}
 
     if not rows:
-        return {"closed": 0}
+        return {"closed": 0, "tracking": tracking}
 
     rs = [float(r["r_multiple"] or 0) for r in rows]
     wins = [x for x in rs if x > 0]
@@ -1526,6 +1582,7 @@ def outcome_stats(db_file: str) -> dict:
     gross_win = sum(wins)
     gross_loss = abs(sum(losses))
     by_grade = {}
+    by_outcome = {}
     for r in rows:
         g = r["grade"] or "?"
         d = by_grade.setdefault(g, {"n": 0, "wins": 0, "r": 0.0})
@@ -1533,9 +1590,11 @@ def outcome_stats(db_file: str) -> dict:
         d["r"] += float(r["r_multiple"] or 0)
         if float(r["r_multiple"] or 0) > 0:
             d["wins"] += 1
+        by_outcome[r["outcome"]] = by_outcome.get(r["outcome"], 0) + 1
 
     return {
         "closed": len(rows),
+        "tracking": tracking,
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": len(wins) / len(rows) * 100,
@@ -1545,6 +1604,7 @@ def outcome_stats(db_file: str) -> dict:
         "avg_loss_r": (-gross_loss / len(losses)) if losses else 0.0,
         "profit_factor": (gross_win / gross_loss) if gross_loss else float("inf"),
         "by_grade": by_grade,
+        "by_outcome": by_outcome,
     }
 
 
