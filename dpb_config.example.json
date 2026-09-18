@@ -66,10 +66,11 @@
   "paxg_alert_enabled": true,
   "paxg_alert_max_age_hours": 24,
   "use_position_sizing": true,
-  "account_equity": 1000,
+  "account_equity": 700,
   "risk_per_trade_pct": 1.0,
   "contract_oz": 100,
   "min_lot": 0.01,
   "max_lot": 10.0,
-  "require_resonance": false
+  "require_resonance": false,
+  "leverage": 1000
 }

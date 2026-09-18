@@ -94,9 +94,10 @@ def load_config():
         "trend_cooldown_bars": 5,
         # 做单策略：仓位管理（把「下多少手」变成信号的一部分）
         "use_position_sizing": True,
-        "account_equity": 1000,        # 账户资金
+        "account_equity": 700,         # 账户资金（USDT/USD）
         "risk_per_trade_pct": 1.0,     # 单笔风险占总资金 %
-        "contract_oz": 100,            # 黄金 1 标准手 = 100 盎司（每$1波动=$100/手）
+        "contract_oz": 100,            # 黄金 1 标准手 = 100 盎司 → 0.01手=1盎司, $1波动=$1
+        "leverage": 1000,              # 杠杆倍数（用于估算保证金占用）
         "min_lot": 0.01,               # 最小可下单手数
         "max_lot": 10.0,               # 手数安全上限（防手滑重仓）
         "require_resonance": False,    # 是否只推送「多周期共振」的信号
@@ -959,15 +960,23 @@ def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
             lots = max_lot
             capped = "capped"     # 安全上限截断
 
+    actual_risk = lots * sl_dist * contract_oz
+    leverage = float(cfg.get("leverage", 1000) or 1)
+    # 保证金占用 ≈ 名义价值 / 杠杆 = 入场价 × 盎司数 / 杠杆
+    margin = entry * contract_oz * lots / leverage if leverage > 0 else 0.0
+
     return {
         "ok": True,
         "lots": lots,
         "raw_lots": raw_lots,
         "risk_amount": risk_amount,       # 按风险%应承担
-        "actual_risk": lots * sl_dist * contract_oz,  # 实际下单后的风险
+        "actual_risk": actual_risk,       # 实际下单后的风险
+        "actual_pct": actual_risk / equity * 100 if equity else 0.0,
         "sl_dist": sl_dist,
         "risk_pct": risk_pct,
         "equity": equity,
+        "margin": margin,
+        "leverage": leverage,
         "capped": capped,
         "point_value": contract_oz,
     }
@@ -1049,11 +1058,18 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
     ]
     if ps and ps.get("ok"):
         lines.append(
-            f"> 💰 **建议手数: {ps['lots']:.2f} 手**"
-            f" | 风险 ${ps['actual_risk']:.2f} ({ps['risk_pct']:.1f}% / ${ps['equity']:.0f})"
+            f"> 💰 **手数: {ps['lots']:.2f} 手**"
+            f" | 保证金 ~${ps['margin']:.2f} (占用 {ps['margin'] / ps['equity'] * 100:.1f}%)"
+        )
+        over = ps["actual_pct"] > ps["risk_pct"] * 1.5
+        lines.append(
+            f"> 风险: **${ps['actual_risk']:.2f}** = 账户 **{ps['actual_pct']:.2f}%**"
+            f" (目标 {ps['risk_pct']:.1f}%){' ⚠️超目标' if over else ''}"
         )
         if ps["capped"] == "undersized":
-            lines.append(f"> ⚠️ 止损偏宽：按风险%仅需 {ps['raw_lots']:.4f} 手，已按最小 {ps['lots']:.2f} 手计")
+            lines.append(
+                f"> ⚠️ 止损偏宽：按目标风险仅需 {ps['raw_lots']:.4f} 手，已按最小手数下单"
+            )
         elif ps["capped"] == "capped":
             lines.append(f"> ⚠️ 已达手数上限，按 {ps['lots']:.2f} 手截断")
     if resonance:
