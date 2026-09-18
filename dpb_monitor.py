@@ -106,6 +106,9 @@ def load_config():
         "max_sl_atr": 4.0,             # 止损最远：最多 4×ATR（限制单笔敞口）
         "fallback_sl_atr": 1.5,        # 结构失效（止损落到入场价另一侧）时的兜底倍数
         "outcome_max_age_days": 30,    # 结果追踪回看天数
+        # 斐波那契
+        "fib_lookback": 50,            # 计算摆动高低点回看的K线数
+        "show_fib": True,              # 做单卡片是否展示斐波那契回撤区/扩展目标
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(default, f, indent=2, ensure_ascii=False)
@@ -384,6 +387,50 @@ def calc_rsi(series: pd.Series, length: int = 14) -> pd.Series:
 
 
 # 交易频率预设：仅当 config 未显式提供对应参数时兜底
+_FIB_RETR = (0.382, 0.5, 0.618)     # 黄金回撤区
+_FIB_EXT = (1.272, 1.618)           # 扩展目标位
+_SCORE_MAX = 9                      # 信号满分（含斐波那契维度）
+
+
+def _grade_of(score: int, n: int = _SCORE_MAX) -> str:
+    """按比例折算等级，使新增评分维度时门槛自动等比缩放（不破坏原有区分度）。"""
+    r = score / n if n else 0
+    return "S" if r >= 0.875 else "A" if r >= 0.625 else "B" if r >= 0.375 else "C"
+
+
+def calc_fib(df: pd.DataFrame, lookback: int = 50) -> pd.DataFrame:
+    """斐波那契回撤/扩展位（基于最近 lookback 根K线的摆动高/低点）。
+
+    上升趋势：自高点向下回撤 → 支撑区；扩展位向上 → 止盈目标。
+    下降趋势：自低点向上反弹 → 阻力区；扩展位向下 → 止盈目标。
+    """
+    hi = df["High"].rolling(lookback, min_periods=5).max()
+    lo = df["Low"].rolling(lookback, min_periods=5).min()
+    rng = (hi - lo).replace(0, np.nan)
+
+    df["fib_hi"], df["fib_lo"] = hi, lo
+    for r in _FIB_RETR:
+        df[f"fib_up_{r}"] = hi - rng * r       # 上升趋势回撤支撑
+        df[f"fib_dn_{r}"] = lo + rng * r       # 下降趋势反弹阻力
+    for e in _FIB_EXT:
+        df[f"fib_ext_up_{e}"] = lo + rng * e   # 上升趋势扩展目标（在高点之上）
+        df[f"fib_ext_dn_{e}"] = hi - rng * e   # 下降趋势扩展目标（在低点之下）
+    return df
+
+
+def _fib_zone(row, long: bool, atr: float, tol_atr: float = 0.2):
+    """返回该方向斐波那契回撤区的 (下沿, 上沿)，无效时返回 None。"""
+    if long:
+        a, b = row.get("fib_up_0.382"), row.get("fib_up_0.618")
+    else:
+        a, b = row.get("fib_dn_0.382"), row.get("fib_dn_0.618")
+    if a is None or b is None or np.isnan(a) or np.isnan(b):
+        return None
+    tol = (atr * tol_atr) if (atr and not np.isnan(atr)) else 0.0
+    return min(a, b) - tol, max(a, b) + tol
+
+
+# 交易频率预设：仅当 config 未显式提供对应参数时兜底
 _FREQ_PRESETS = {
     "保守": {"trend_stability": 20, "signal_cooldown": 10, "breakout_tolerance": 5},
     "标准": {"trend_stability": 15, "signal_cooldown": 5, "breakout_tolerance": 3},
@@ -408,12 +455,13 @@ def _apply_freq_preset(cfg: dict) -> dict:
 
 
 def _score_signal(row, direction: int, mode: str, **extra) -> tuple:
-    """统一信号评分（0-8 分），回踩与突破模式共用；direction: 1=多, -1=空。
+    """统一信号评分（0-9 分），回踩与突破模式共用；direction: 1=多, -1=空。
 
-    评分维度（每项 0/1）：
+    评分维度（每项 0/1，共 9 项）：
       1 趋势稳定  2 趋势强度(EMA分离)  3 RSI 合理区  4 动能确认
       5 模式项    6 形态项             7 带位/稳定性  8 结构确认
-    等级：S>=7, A>=5, B>=3, C<3
+      9 斐波那契回撤区（入场落在 0.382~0.618 黄金带）
+    等级按比例折算（见 _grade_of）：S≥87.5% / A≥62.5% / B≥37.5%
 
     修复前：突破模式只算 3 项（上限 = B 级），回踩模式含一项"假设结构过滤通过"
     的假分 → 实测近千根 K 线 S 级恒为 0。此函数用真实指标替代，恢复等级区分度。
@@ -445,8 +493,12 @@ def _score_signal(row, direction: int, mode: str, **extra) -> tuple:
         s += 1 if (row["bo_stable_up"] if long else row["bo_stable_down"]) else 0
     # 8 结构确认：价格在慢线正确一侧
     s += 1 if ((row["Close"] > row["ema50"]) if long else (row["Close"] < row["ema50"])) else 0
-    grade = "S" if s >= 7 else "A" if s >= 5 else "B" if s >= 3 else "C"
-    return s, grade
+    # 9 斐波那契回撤区确认：入场落在 0.382~0.618 黄金回撤带
+    #   （DPB 的「二次回踩」本质就是等价格回到支撑，和斐波那契回撤区天然同源）
+    zone = _fib_zone(row, long, atr)
+    if zone and zone[0] <= row["Close"] <= zone[1]:
+        s += 1
+    return s, _grade_of(s)
 
 
 def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -468,6 +520,9 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     # ATR, RSI
     df["atr"] = calc_atr(df, 14)
     df["rsi"] = calc_rsi(df["Close"], c["rsi_len"])
+
+    # 斐波那契回撤/扩展位
+    df = calc_fib(df, c.get("fib_lookback", 50))
     
     # K线形态
     df["range"] = df["High"] - df["Low"]
@@ -1087,6 +1142,19 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
         f"> TP1: **{tp1:.2f}**  ({r1}R)",
         f"> TP2: **{tp2:.2f}**  ({r2}R)",
     ]
+    # 斐波那契：回撤区（入场位置质量）+ 扩展目标（另一组止盈参考）
+    if cfg.get("show_fib", True):
+        z = _fib_zone(row, signal > 0, row.get("atr"))
+        if z:
+            lines.append(
+                f"> 📐 斐波回撤区: {z[0]:.1f} ~ {z[1]:.1f} "
+                f"{'✓ 现价在区内' if z[0] <= entry <= z[1] else '— 现价在区外'}"
+            )
+        k1, k2 = (("fib_ext_up_1.272", "fib_ext_up_1.618") if signal > 0
+                  else ("fib_ext_dn_1.272", "fib_ext_dn_1.618"))
+        v1, v2 = row.get(k1), row.get(k2)
+        if v1 is not None and v2 is not None and not np.isnan(v1) and not np.isnan(v2):
+            lines.append(f"> 🎯 斐波扩展目标: {v1:.1f} / {v2:.1f}")
     if ps and ps.get("ok"):
         lines.append(
             f"> 💰 **手数: {ps['lots']:.2f} 手**"
@@ -1097,9 +1165,10 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
             f"> 风险: **${ps['actual_risk']:.2f}** = 账户 **{ps['actual_pct']:.2f}%**"
             f" (目标 {ps['risk_pct']:.1f}%){' ⚠️超目标' if over else ''}"
         )
-        if ps["capped"] == "undersized":
+        if ps["capped"] == "undersized" and over:
+            # 仅在「最小手数导致实际风险明显超标」时才提示，避免每单都刷
             lines.append(
-                f"> ⚠️ 止损偏宽：按目标风险仅需 {ps['raw_lots']:.4f} 手，已按最小手数下单"
+                f"> ⚠️ 止损偏宽：按目标风险仅需 {ps['raw_lots']:.4f} 手，受最小手数限制"
             )
         elif ps["capped"] == "capped":
             lines.append(f"> ⚠️ 已达手数上限，按 {ps['lots']:.2f} 手截断")
@@ -1495,7 +1564,7 @@ def check_signals(cfg: dict, state: dict) -> dict:
             type_tag = f"[{sig_type}]" if sig_type else ""
             grade = last.get("signal_grade", "")
             score = last.get("signal_score", 0)
-            grade_tag = f"[{grade}级{score}/8]" if grade else ""
+            grade_tag = f"[{grade}级{score}/{_SCORE_MAX}]" if grade else ""
             band = last.get("signal_band", "")
             band_tag = f"({band})" if band else ""
             res_tag = f" 🔥共振{len(res_tfs)}" if res_tfs else ""

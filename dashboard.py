@@ -294,7 +294,7 @@ async function load(){
       add('趋势', d.trend); add('收盘', d.close); add('RSI', d.rsi); add('ATR', d.atr);
       let sigTxt = d.signal===1?'🟢做多':d.signal===-1?'🔴做空':'—';
       if(d.signal!==0 && d.type) sigTxt += ` [${d.type}]`;
-      if(d.signal!==0 && d.grade) sigTxt += ` ${d.grade}级${d.score}/8`;
+      if(d.signal!==0 && d.grade) sigTxt += ` ${d.grade}级${d.score}/9`;
       add('信号', sigTxt);
       add('动能', d.vol_ok?'✓':'✗');
       add('K线时间', d.bar_time);
@@ -342,7 +342,7 @@ async function load(){
       top.appendChild(E('span','tfname', s.timeframe));
       top.appendChild(E('span', s.direction===1?'dir-long':'dir-short', s.direction===1?'🟢 做多':'🔴 做空'));
       if(s.sig_type) top.appendChild(E('span','muted', s.sig_type));
-      if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/8')));
+      if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/9')));
       if(s.resonance>=2) top.appendChild(E('span','fire','🔥共振'+s.resonance));
       top.appendChild(E('span','time', s.pushed_at||''));
       box.appendChild(top);
