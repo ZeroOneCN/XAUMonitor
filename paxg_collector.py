@@ -203,6 +203,9 @@ class LevelWatcher:
                 lv.append({
                     "id": f"{kind}:{float(price):.2f}", "kind": kind, "price": float(price),
                     "label": label, "entry": float(entry), "sl": float(sl),
+                    "tp1": float(tp1) if tp1 is not None else None,
+                    "tp2": float(tp2) if tp2 is not None else None,
+                    "direction": int(d),
                     "pushed_at": pushed_at,
                 })
         self.levels = lv
@@ -229,16 +232,33 @@ class LevelWatcher:
         self.prev = price
 
     def _alert(self, l: dict, price: float):
+        """推送盘中触发提醒 —— 带上完整做单计划（入场/止损/TP1/TP2 + R 倍数），
+        否则用户只知道"碰到了某个价"，却不知道剩余目标在哪。"""
         emoji = {"入场": "🎯", "止损": "🛑", "TP1": "✅", "TP2": "🏆"}.get(l["kind"], "🔔")
         title = f"{emoji} 盘中触发 {l['kind']} | {l['label']}"
-        content = (
-            f"> 触发价: **{l['price']:.2f}**\n"
-            f"> 现价(PAXG): **{price:.2f}**\n"
-            f"> 信号入场: {l['entry']:.2f} / 止损: {l['sl']:.2f}\n"
-            f"> 信号时间: {l['pushed_at']}"
-        )
+
+        e = float(l["entry"])
+        sl = float(l["sl"])
+        d = int(l.get("direction", 1)) or 1
+        r = abs(e - sl) or 1.0     # 1R = 入场到止损的距离
+
+        def rel(p):
+            """价格 + 相对入场价的偏移 + R 倍数（正=有利，负=不利）"""
+            if p is None:
+                return "—"
+            diff = (float(p) - e) * d
+            return f"**{float(p):.2f}** ({diff:+.2f}, {diff / r:+.2f}R)"
+
+        lines = [
+            f"> 触发价 **{l['price']:.2f}**  |  现价 **{price:.2f}**",
+            f"> 🎯 入场 {e:.2f}",
+            f"> 🛑 止损 {rel(sl)}",
+            f"> ✅ TP1　{rel(l.get('tp1'))}",
+            f"> 🏆 TP2　{rel(l.get('tp2'))}",
+            f"> 信号时间 {l['pushed_at']}",
+        ]
         log.info(f"[做单] 触发 {l['kind']} @ {l['price']:.2f} (现价 {price:.2f})")
-        send_alert(title, content)
+        send_alert(title, "\n".join(lines) + "\n")
 
 
 # ============================================================
