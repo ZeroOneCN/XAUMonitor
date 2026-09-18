@@ -20,4 +20,4 @@ dpb_signals.txt
 __pycache__/
 *.py[cod]
 .venv/
-venv/
+venv/paxg_fired.json

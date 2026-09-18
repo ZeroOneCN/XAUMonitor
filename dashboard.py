@@ -88,9 +88,11 @@ def api_stats():
 @app.get("/api/signals")
 def api_signals(limit: int = 60):
     rows = _query(
-        "SELECT id, ts, pushed_at, timeframe, direction, sig_type, grade, score,"
-        " band, entry, sl, tp1, tp2, rsi, atr, resonance"
-        " FROM signals ORDER BY id DESC LIMIT ?",
+        "SELECT s.id, s.ts, s.pushed_at, s.timeframe, s.direction, s.sig_type, s.grade, s.score,"
+        " s.band, s.entry, s.sl, s.tp1, s.tp2, s.rsi, s.atr, s.resonance,"
+        " o.outcome, o.r_multiple"
+        " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+        " ORDER BY s.id DESC LIMIT ?",
         (int(limit),),
     )
     return {"count": len(rows), "signals": rows}
@@ -182,75 +184,89 @@ HTML_PAGE = """<!DOCTYPE html>
   * { box-sizing:border-box; -webkit-text-size-adjust:100%; }
   body { margin:0; background:var(--bg); color:var(--fg); font-size:var(--fs); line-height:1.5;
          font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:840px; margin:0 auto; padding:14px 12px 30px; }
-  h1 { font-size:22px; margin:0 0 2px; letter-spacing:.5px; }
-  h2 { font-size:18px; margin:0 0 10px; padding-left:9px; border-left:4px solid var(--blue); }
-  .sub { color:var(--mut); font-size:14px; margin-bottom:16px; }
-  section { margin-bottom:20px; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:10px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
-  .card .v { font-size:30px; font-weight:800; line-height:1.15; }
-  .card .l { color:var(--mut); font-size:14px; margin-top:2px; }
-  .tf-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px; }
-  .tf { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
-  .tf .name { font-size:19px; font-weight:800; margin-bottom:8px; }
-  .tf .row { display:flex; justify-content:space-between; gap:10px; font-size:16px; color:var(--mut); padding:2px 0; }
+  .wrap { max-width:1240px; margin:0 auto; padding:12px 12px 26px; }
+  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+  h1 { font-size:21px; margin:0; letter-spacing:.3px; white-space:nowrap; }
+  h2 { font-size:16px; margin:0 0 9px; padding-left:8px; border-left:4px solid var(--blue); }
+  .sub { color:var(--mut); font-size:13px; }
+  section { margin-bottom:14px; }
+  /* 顶部指标条：紧凑，一屏放得下 */
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(104px,1fr)); gap:8px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:9px 12px; }
+  .card .v { font-size:23px; font-weight:800; line-height:1.15; }
+  .card .l { color:var(--mut); font-size:12px; margin-top:1px; }
+  /* 主区：桌面左右双列，信号在左（视觉第一优先） */
+  .main { display:grid; gap:14px; align-items:start; }
+  .col-b > section:last-child { margin-bottom:0; }
+  @media (min-width:960px){
+    .main { grid-template-columns:minmax(0,1.3fr) minmax(0,1fr); }
+  }
+  /* 各周期状态：紧凑卡片网格 */
+  .tf-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:8px; }
+  .tf { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:9px 11px; }
+  .tf .name { font-size:16px; font-weight:800; margin-bottom:5px; display:flex; justify-content:space-between; align-items:baseline; }
+  .tf .name span { font-size:12px; font-weight:600; color:var(--mut); }
+  .tf .row { display:flex; justify-content:space-between; gap:8px; font-size:13px; color:var(--mut); padding:1px 0; }
   .tf .row b { color:var(--fg); font-weight:700; }
   .sig { background:var(--card); border:1px solid var(--border); border-radius:12px;
-         padding:13px 15px; margin-bottom:10px; }
-  .sig .top { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:10px; }
-  .sig .tfname { font-size:19px; font-weight:800; }
-  .sig .time { color:var(--mut); font-size:14px; margin-left:auto; }
-  .sig .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px 14px; }
-  .sig .kv { font-size:16px; color:var(--mut); display:flex; justify-content:space-between; gap:8px; }
+         padding:11px 13px; margin-bottom:9px; }
+  .sig .top { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:8px; }
+  .sig .tfname { font-size:18px; font-weight:800; }
+  .sig .time { color:var(--mut); font-size:13px; margin-left:auto; }
+  .sig .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px 14px; }
+  .sig .kv { font-size:15px; color:var(--mut); display:flex; justify-content:space-between; gap:8px; }
   .sig .kv b { color:var(--fg); font-weight:800; }
   .dir-long { color:var(--green); font-weight:800; }
   .dir-short { color:var(--red); font-weight:800; }
-  .pill { display:inline-block; padding:2px 9px; border-radius:11px; font-size:14px; font-weight:800; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:11px; font-size:13px; font-weight:800; }
   .S{background:#e3b341;color:#000} .A{background:#3fb950;color:#000}
   .B{background:#58a6ff;color:#000} .C{background:#8a94a6;color:#000}
   .fire{color:var(--gold);font-weight:800}
-  .muted{color:var(--mut);font-size:15px}
-  .big{font-size:20px;font-weight:800}
+  .muted{color:var(--mut);font-size:14px}
+  .big{font-size:19px;font-weight:800}
+  .foot{text-align:center;padding:8px 0 18px;font-size:12px;color:var(--mut)}
   @media (max-width:430px){
-    :root{ --fs:16px; }
-    .wrap{ padding:12px 10px 26px; }
-    .cards{ grid-template-columns:repeat(2,1fr); }
-    .card .v{ font-size:26px; }
+    h1{ font-size:19px; }
+    .wrap{ padding:10px 9px 22px; }
+    .cards{ grid-template-columns:repeat(3,1fr); }
+    .card .v{ font-size:20px; }
     .sig .grid{ grid-template-columns:1fr; }
-    h1{ font-size:20px; }
   }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>⚡ XAUMonitor · DPB 黄金信号监控</h1>
-  <div class="sub" id="sub">加载中…</div>
+  <header>
+    <h1>⚡ XAUMonitor · DPB 黄金信号</h1>
+    <div class="sub" id="sub">加载中…</div>
+  </header>
 
   <div class="cards" id="cards"></div>
+  <div id="stats" class="muted" style="margin:9px 0 13px"></div>
 
-  <section>
-    <h2>各周期实时状态</h2>
-    <div class="tf-grid" id="tfGrid"></div>
-  </section>
+  <div class="main">
+    <!-- 左（第一优先）：信号 -->
+    <section>
+      <h2>🔔 最近信号</h2>
+      <div id="sigWrap" class="muted">加载中…</div>
+    </section>
 
-  <section>
-    <h2>信号统计</h2>
-    <div id="stats" class="muted"></div>
-  </section>
+    <!-- 右：胜率 + 实时状态 -->
+    <div class="col-b">
+      <section>
+        <h2>📊 结果追踪 · 胜率</h2>
+        <div class="cards" id="outCards"></div>
+        <div id="outDetail" class="muted" style="margin-top:10px"></div>
+      </section>
 
-  <section>
-    <h2>结果追踪 · 胜率</h2>
-    <div class="cards" id="outCards"></div>
-    <div id="outDetail" class="muted" style="margin-top:12px"></div>
-  </section>
+      <section>
+        <h2>📈 各周期实时状态</h2>
+        <div class="tf-grid" id="tfGrid"></div>
+      </section>
+    </div>
+  </div>
 
-  <section>
-    <h2>最近信号</h2>
-    <div id="sigWrap" class="muted">加载中…</div>
-  </section>
-
-  <div class="muted" style="text-align:center;padding:10px 0 30px;font-size:12px">
+  <div class="foot">
     数据源 signals.db + dpb_status.json · 每 30 秒自动刷新 · 零 API 消耗
   </div>
 </div>
@@ -289,17 +305,18 @@ async function load(){
     if(!keys.length){ tg.appendChild(E('div','muted','暂无状态快照（监控端首次循环后会写入）')); }
     Object.entries(tfs).forEach(([tf,d])=>{
       const box=E('div','tf');
-      box.appendChild(E('div','name',tf));
+      const nm=E('div','name');
+      nm.appendChild(E('span',null,tf));
+      nm.appendChild(E('span',null,d.trend||''));
+      box.appendChild(nm);
       const add=(k,v)=>{const r=E('div','row');r.appendChild(E('span',null,k));r.appendChild(E('b',null,v));box.appendChild(r);};
-      add('趋势', d.trend); add('收盘', d.close); add('RSI', d.rsi); add('ATR', d.atr);
-      if(d.adx!=null) add('ADX', `${d.adx}${d.adx>=25?' 强趋势':d.adx<20?' 偏弱':' 中等'}`);
-      if(d.fib_zone && d.fib_zone.length===2) add('斐波回撤区', `${d.fib_zone[0]} ~ ${d.fib_zone[1]}`);
+      add('收盘/RSI/ATR', `${d.close} / ${d.rsi} / ${d.atr}`);
+      if(d.adx!=null) add('ADX', `${d.adx} ${d.adx>=25?'强':d.adx<20?'弱':'中'}`);
       let sigTxt = d.signal===1?'🟢做多':d.signal===-1?'🔴做空':'—';
       if(d.signal!==0 && d.type) sigTxt += ` [${d.type}]`;
-      if(d.signal!==0 && d.grade) sigTxt += ` ${d.grade}级${d.score}/10`;
+      if(d.signal!==0 && d.grade) sigTxt += ` ${d.grade}${d.score}/10`;
       add('信号', sigTxt);
-      add('动能', d.vol_ok?'✓':'✗');
-      add('K线时间', d.bar_time);
+      add('K线', d.bar_time);
       tg.appendChild(box);
     });
 
@@ -338,6 +355,8 @@ async function load(){
     const sw=document.getElementById('sigWrap'); sw.innerHTML='';
     if(!sg.signals.length){ sw.appendChild(E('div','muted','暂无信号记录')); return; }
     const num = v => (v==null||v==='')?'-':(typeof v==='number'?v.toFixed(2):v);
+    const OUT = {SL:['❌ 止损','#f85149'], TP1:['✅ 达TP1','#3fb950'],
+                 TP2:['🏆 达TP2','#3fb950'], open:['⏳ 持仓中','#e3b341']};
     sg.signals.forEach(s=>{
       const box=E('div','sig');
       const top=E('div','top');
@@ -346,6 +365,14 @@ async function load(){
       if(s.sig_type) top.appendChild(E('span','muted', s.sig_type));
       if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/10')));
       if(s.resonance>=2) top.appendChild(E('span','fire','🔥共振'+s.resonance));
+      // 每条信号直接显示当前结果，不用去别处找
+      if(s.outcome){
+        const [txt,col] = OUT[s.outcome] || [s.outcome,'#9aa7b6'];
+        const rr = (s.r_multiple!=null) ? ` ${s.r_multiple>=0?'+':''}${Number(s.r_multiple).toFixed(2)}R` : '';
+        const bd = E('span',null,txt+rr);
+        bd.style.cssText = `font-weight:800;font-size:13px;color:${col}`;
+        top.appendChild(bd);
+      }
       top.appendChild(E('span','time', s.pushed_at||''));
       box.appendChild(top);
       const g=E('div','grid');
@@ -354,7 +381,7 @@ async function load(){
       kv('止损', num(s.sl));
       kv('TP1', num(s.tp1));
       kv('TP2', num(s.tp2));
-      kv('RSI', s.rsi==null?'-':s.rsi);
+      kv('RSI', s.rsi==null?'-':Number(s.rsi).toFixed(1));
       kv('ATR', num(s.atr));
       box.appendChild(g);
       sw.appendChild(box);

@@ -52,6 +52,7 @@ PING_TIMEOUT = 60
 # 做单数据推送
 CONFIG_FILE = BASE / "dpb_config.json"       # 复用监控的配置(取 webhook)
 SIGNALS_DB = BASE / "signals.db"             # 复用监控的信号库
+FIRED_FILE = BASE / "paxg_fired.json"        # 已触发价位记录（持久化，避免重启后重发）
 LEVEL_RELOAD_SECS = 60                       # 重新加载监控价位的间隔
 LEVEL_MAX_SIGNALS = 20                       # 最多盯最近多少条信号
 DEFAULT_ALERT_MAX_AGE_H = 24                 # 信号超过多少小时不再盯（兜底）
@@ -189,9 +190,26 @@ class LevelWatcher:
         self.enabled = enabled
         self.max_age_h = max_age_h
         self.levels = []
-        self.fired = set()
+        self.fired = self._load_fired()
         self.prev = None
         self.last_reload = 0.0
+
+    # ---------- 已触发记录持久化 ----------
+    # 只放在内存里的话，每次重启服务都会把已提醒过的价位重新提醒一遍
+    # （实测：重启后 TP1 又被推了一次）。
+    def _load_fired(self) -> set:
+        try:
+            with open(FIRED_FILE, encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+
+    def _save_fired(self):
+        try:
+            with open(FIRED_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(self.fired), f, ensure_ascii=False)
+        except Exception as e:
+            log.error(f"[做单] 已触发记录落盘失败: {e}")
 
     def _reload(self):
         if not SIGNALS_DB.exists():
@@ -253,7 +271,10 @@ class LevelWatcher:
                 })
         self.levels = lv
         # 已触发的记录只保留仍在监控中的价位，避免无限增长
+        before = len(self.fired)
         self.fired &= {l["id"] for l in lv}
+        if len(self.fired) != before:
+            self._save_fired()
         msg = f"[做单价位] {len(rows)} 条未结案信号 → 监控 {len(lv)} 个价位"
         if dropped:
             msg += f" | 按周期过期剔除 {len(dropped)}: {', '.join(dropped[:4])}"
@@ -284,6 +305,7 @@ class LevelWatcher:
             if want and crossed != want:
                 continue           # 方向不符：做多的止盈不会在「下穿」时被触及
             self.fired.add(l["id"])
+            self._save_fired()          # 落盘，重启后不会重发
             self._alert(l, price)
         self.prev = price
 
