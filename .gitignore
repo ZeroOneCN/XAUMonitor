@@ -25,3 +25,5 @@ news_calendar.json
 dpb_heartbeat.txt
 watchdog_state.json
 watchdog.log
+backtest_cache/
+backtest_full.log
