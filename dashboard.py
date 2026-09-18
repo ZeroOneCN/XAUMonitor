@@ -102,7 +102,7 @@ def api_signals(limit: int = 60):
 def api_outcomes():
     """结果追踪统计：胜率 / 期望值 / 盈亏因子（做单策略的验证闭环）"""
     rows = _query(
-        "SELECT o.outcome, o.r_multiple, o.bars, o.mfe, o.mae, o.resolved_at,"
+        "SELECT o.outcome, o.r_multiple, o.bars, o.mfe, o.mae, o.resolved_at, o.cost_r,"
         " s.grade, s.sig_type, s.timeframe, s.direction, s.id"
         " FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id"
         " ORDER BY s.id"
@@ -117,6 +117,7 @@ def api_outcomes():
                 "by_grade": {}, "by_type": {}, "by_timeframe": {}, "recent": []}
 
     rs = [float(r["r_multiple"] or 0) for r in closed]
+    cost_total = sum(float(r["cost_r"] or 0) for r in closed)
     wins = [x for x in rs if x > 0]
     gross_win = sum(wins)
     gross_loss = abs(sum(x for x in rs if x <= 0))
@@ -141,6 +142,9 @@ def api_outcomes():
         "win_rate": len(wins) / len(closed) * 100,
         "expectancy_r": sum(rs) / len(closed),
         "total_r": sum(rs),
+        "cost_total_r": cost_total,
+        "gross_total_r": sum(rs) + cost_total,
+        "avg_cost_r": cost_total / len(closed),
         "profit_factor": (gross_win / gross_loss) if gross_loss else None,
         "by_grade": _agg("grade"),
         "by_type": _agg("sig_type"),
@@ -197,6 +201,10 @@ HTML_PAGE = """<!DOCTYPE html>
   .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:9px 12px; }
   .card .v { font-size:23px; font-weight:800; line-height:1.15; }
   .card .l { color:var(--mut); font-size:12px; margin-top:1px; }
+  /* 数据发布窗口告警卡：必须一眼可见 */
+  .card.warn { background:#3d1d1d; border-color:#f85149; }
+  .card.warn .v { color:#ff7b72; font-size:17px; }
+  .card.warn .l { color:#ff9a92; }
   /* 主区：桌面左右双列，信号在左（视觉第一优先） */
   .main { display:grid; gap:14px; align-items:start; }
   .col-b > section:last-child { margin-bottom:0; }
@@ -292,13 +300,24 @@ async function load(){
       `${fmtN(sy.config.ticker)} · ${snap.updated_at?('快照更新 '+snap.updated_at):'暂无快照'} · 间隔 ${sy.config.check_interval_minutes} 分钟`;
 
     // 卡片
-    const cards = [
+    // 数据发布窗口：命中时置顶警示（这是防爆仓的硬拦截）
+    const nw = snap.news || {};
+    const cards = [];
+    if(nw.blocked){
+      cards.push(['⛔ 数据窗口', nw.event||'禁开仓', 'warn']);
+    } else if(nw.enabled && nw.upcoming){
+      cards.push(['下次数据', nw.upcoming.split(' ').slice(-1)[0], '']);
+    }
+    cards.push(
       ['信号总数', st.total, ''], ['今日', st.today, ''],
       ['🔥共振', st.resonance, ''], ['S级', st.by_grade.S||0, 'gold'],
       ['A级', st.by_grade.A||0, ''], ['B级', st.by_grade.B||0, ''],
-    ];
+    );
     const cw = document.getElementById('cards'); cw.innerHTML='';
-    cards.forEach(([l,v])=>{const c=E('div','card');c.appendChild(E('div','v',v));c.appendChild(E('div','l',l));cw.appendChild(c);});
+    cards.forEach(([l,v,cls])=>{
+      const c=E('div','card'+(cls?' '+cls:''));
+      c.appendChild(E('div','v',v)); c.appendChild(E('div','l',l)); cw.appendChild(c);
+    });
 
     // 各周期状态
     const tg = document.getElementById('tfGrid'); tg.innerHTML='';
@@ -333,7 +352,9 @@ async function load(){
       const cards2 = [
         ['胜率', oc.win_rate.toFixed(1)+'%', ''],
         ['期望值', (oc.expectancy_r>=0?'+':'')+oc.expectancy_r.toFixed(2)+'R', ''],
-        ['累计R', (oc.total_r>=0?'+':'')+oc.total_r.toFixed(2)+'R', ''],
+        ['净值R', (oc.total_r>=0?'+':'')+oc.total_r.toFixed(2)+'R', ''],
+        ['毛值R', ((oc.gross_total_r||0)>=0?'+':'')+(oc.gross_total_r||0).toFixed(2)+'R', ''],
+        ['点差成本', '-'+(oc.cost_total_r||0).toFixed(2)+'R', ''],
         ['盈亏因子', oc.profit_factor==null?'∞':oc.profit_factor.toFixed(2), ''],
         ['已结案', oc.closed, ''],
         ['追踪中', oc.tracking||0, ''],
@@ -342,7 +363,8 @@ async function load(){
       const agg=(obj,label)=>{const ks=Object.keys(obj||{});if(!ks.length)return '';
         return ` · ${label}: `+ks.map(k=>`${k} ${obj[k].wins}/${obj[k].n}(${obj[k].r>=0?'+':''}${obj[k].r.toFixed(1)}R)`).join('  ');};
       const oc2 = oc.by_outcome ? ' · 结局: '+Object.entries(oc.by_outcome).map(([k,v])=>`${k} ${v}`).join('  ') : '';
-      od.textContent = `胜 ${oc.wins} / 负 ${oc.losses} · 追踪中 ${oc.tracking||0}` + oc2
+      const costNote = oc.cost_total_r ? ` · 点差每笔均 ${(oc.avg_cost_r||0).toFixed(3)}R(已扣在净值里)` : '';
+      od.textContent = `胜 ${oc.wins} / 负 ${oc.losses} · 追踪中 ${oc.tracking||0}` + oc2 + costNote
         + agg(oc.by_grade,'按等级') + agg(oc.by_type,'按类型') + agg(oc.by_timeframe,'按周期');
     }
 

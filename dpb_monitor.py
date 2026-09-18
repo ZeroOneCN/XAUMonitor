@@ -117,6 +117,8 @@ def load_config():
         "tp1_exit_pct": 0.5,           # TP1 了结的仓位比例，其余留到 TP2
         "be_after_tp1": True,          # TP1 后止损是否移到保本（剩余仓位按 0R 计）
         "outcome_max_bars": {},        # 各周期扫描窗口(根)，{} 用内置按周期默认
+        # 点差成本（下单即付，一进一出按一个点差计；0 = 不扣）
+        "spread_usd": 0.2,
         # 财经数据发布黑名单（动态拉取 ForexFactory 周历）
         "news_filter_enabled": True,
         "news_impact_levels": ["high"],        # high / medium / low
@@ -1245,6 +1247,16 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
             )
         elif ps["capped"] == "capped":
             lines.append(f"> ⚠️ 已达手数上限，按 {ps['lots']:.2f} 手截断")
+    # 点差成本：下单即付，一进一出按一个点差计。止损越紧，点差占 R 比例越高
+    # （实测：#18 止损仅 $2.09 → 点差吃掉 9.6% R；#8 止损 $11.78 → 仅 1.7%）
+    _spread = float(cfg.get("spread_usd", 0.2) or 0)
+    if _spread > 0 and r_size > 0:
+        _cost_r = _spread / r_size
+        if _cost_r >= 0.03:      # 3% 以上才提示，避免每单都刷
+            lines.append(
+                f"> ⚠️ 止损偏紧：点差 ${_spread:.2f} 占 **{_cost_r * 100:.1f}% R**"
+                f" → 净 TP1 {r1 - _cost_r:+.2f}R / 净 TP2 {r2 - _cost_r:+.2f}R"
+            )
     if resonance:
         lines.append(f"> 🔥 **多周期共振**({len(resonance_tfs)}个): {', '.join(resonance_tfs)}")
     lines.append(f"> {row.name.strftime('%H:%M')}")
@@ -1317,9 +1329,15 @@ def init_db(db_file: str):
                     mfe REAL,            -- 最大有利偏移(R)
                     mae REAL,            -- 最大不利偏移(R)
                     resolved_at TEXT,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    cost_r REAL DEFAULT 0   -- 本笔的点差成本（R 倍数），r_multiple 已是净值
                 )
             """)
+            # 迁移：老库补 cost_r 列（幂等）
+            try:
+                conn.execute("ALTER TABLE signal_outcomes ADD COLUMN cost_r REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
     except Exception as e:
         log.error(f"[DB] 建表失败: {e}")
@@ -1506,6 +1524,7 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
         by_tf.setdefault(r[1], []).append(r)
 
     stats = {"open": 0, "SL": 0, "TP1": 0, "TP2": 0}
+    cost_sum = 0.0                     # 本轮累计点差成本（R）
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     mb_cfg = cfg.get("outcome_max_bars") or _OUTCOME_MAX_BARS
 
@@ -1534,6 +1553,12 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
             if not res:
                 continue
             stats[res["outcome"]] = stats.get(res["outcome"], 0) + 1
+            # 点差成本：把「毛 R」换算成「净 R」。
+            # 下单即付，一进一出按一个点差计（spread_usd，默认 0.2 美元/盎司）。
+            # 止损越紧成本占比越高：止损 \$5.58 时成本 0.036R，\$11.78 时 0.017R。
+            cost_r = (float(cfg.get("spread_usd", 0.2)) / r_size) if r_size else 0.0
+            net_r = float(res["r"]) - cost_r
+            cost_sum += cost_r
             # 只有「真正结案」才写 resolved_at；TP1 未到 TP2 且窗口没走满时
             # 仍然挂为追踪中，这样之后到了 TP2 还能把结果升级上去
             resolved = now_s if res.get("done") else None
@@ -1541,14 +1566,14 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
                 with sqlite3.connect(_db_path(db_file)) as conn:
                     conn.execute(
                         "INSERT INTO signal_outcomes (signal_id, timeframe, direction, outcome,"
-                        " r_multiple, bars, mfe, mae, resolved_at, updated_at)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                        " r_multiple, bars, mfe, mae, resolved_at, updated_at, cost_r)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
                         " ON CONFLICT(signal_id) DO UPDATE SET outcome=excluded.outcome,"
                         " r_multiple=excluded.r_multiple, bars=excluded.bars, mfe=excluded.mfe,"
                         " mae=excluded.mae, resolved_at=excluded.resolved_at,"
-                        " updated_at=excluded.updated_at",
-                        (sid, tf, direction, res["outcome"], res["r"], res["bars"],
-                         res["mfe"], res["mae"], resolved, now_s),
+                        " updated_at=excluded.updated_at, cost_r=excluded.cost_r",
+                        (sid, tf, direction, res["outcome"], net_r, res["bars"],
+                         res["mfe"], res["mae"], resolved, now_s, cost_r),
                     )
                     conn.commit()
             except Exception as e:
@@ -1557,6 +1582,7 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
     log.info(
         f"[追踪] 本轮评估 {len(rows)} 笔 → 止损{stats.get('SL', 0)} "
         f"TP1:{stats.get('TP1', 0)} TP2:{stats.get('TP2', 0)} 追踪中:{stats.get('open', 0)}"
+        f" | 点差成本 {cost_sum:.3f}R (spread={cfg.get('spread_usd', 0.2)})"
     )
     return stats
 
@@ -1572,7 +1598,7 @@ def outcome_stats(db_file: str) -> dict:
         with sqlite3.connect(_db_path(db_file)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT o.outcome, o.r_multiple, o.bars, s.grade, s.sig_type, s.timeframe"
+                "SELECT o.outcome, o.r_multiple, o.bars, o.cost_r, s.grade, s.sig_type, s.timeframe"
                 " FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id"
                 " WHERE o.resolved_at IS NOT NULL"
             ).fetchall()
@@ -1588,6 +1614,7 @@ def outcome_stats(db_file: str) -> dict:
         return {"closed": 0, "tracking": tracking}
 
     rs = [float(r["r_multiple"] or 0) for r in rows]
+    cost_total = sum(float(r["cost_r"] or 0) for r in rows)
     wins = [x for x in rs if x > 0]
     losses = [x for x in rs if x <= 0]
     gross_win = sum(wins)
@@ -1611,6 +1638,10 @@ def outcome_stats(db_file: str) -> dict:
         "win_rate": len(wins) / len(rows) * 100,
         "expectancy_r": sum(rs) / len(rows),
         "total_r": sum(rs),
+        # 点差成本：net = gross - cost，胜率/期望值一律按净 R 算
+        "cost_total_r": cost_total,
+        "gross_total_r": sum(rs) + cost_total,
+        "avg_cost_r": cost_total / len(rows),
         "avg_win_r": (gross_win / len(wins)) if wins else 0.0,
         "avg_loss_r": (-gross_loss / len(losses)) if losses else 0.0,
         "profit_factor": (gross_win / gross_loss) if gross_loss else float("inf"),
