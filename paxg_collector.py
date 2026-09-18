@@ -54,7 +54,31 @@ CONFIG_FILE = BASE / "dpb_config.json"       # 复用监控的配置(取 webhook
 SIGNALS_DB = BASE / "signals.db"             # 复用监控的信号库
 LEVEL_RELOAD_SECS = 60                       # 重新加载监控价位的间隔
 LEVEL_MAX_SIGNALS = 20                       # 最多盯最近多少条信号
-DEFAULT_ALERT_MAX_AGE_H = 24                 # 信号超过多少小时不再盯
+DEFAULT_ALERT_MAX_AGE_H = 24                 # 信号超过多少小时不再盯（兜底）
+
+# 各周期信号的「提醒有效期」（分钟）。
+# 5分钟周期的入场机会几小时后早已完全变味，切成 24 小时一刀切是错的：
+# 会拿着 3 小时前、甚至已经止损了的信号去提醒用户。
+_LEVEL_TTL_MINUTES = {
+    "5m": 60,       # 1 小时
+    "15m": 180,     # 3 小时
+    "1h": 720,      # 12 小时
+    "4h": 2880,     # 2 天
+    "1d": 7200,     # 5 天
+}
+
+
+def _trigger_dir(kind: str, direction: int) -> int:
+    """该价位允许的穿越方向：1=只允许上穿, -1=只允许下穿, 0=双向。
+
+    做多的止盈只可能在「向上」被触及，做多的止损只可能在「向下」被触及。
+    不做方向判断的话，价格从上方跌回止盈位也会误报「✅ 触及止盈」。
+    """
+    if kind == "入场":
+        return 0                      # 入场位两侧都可能回到
+    if kind == "止损":
+        return -direction             # 做多=下穿止损, 做空=上穿止损
+    return direction                  # 止盈：做多=上穿, 做空=下穿
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,20 +196,39 @@ class LevelWatcher:
     def _reload(self):
         if not SIGNALS_DB.exists():
             return
-        cutoff = (datetime.now() - timedelta(hours=self.max_age_h)).strftime("%Y-%m-%d %H:%M:%S")
+        # 回看窗口取各周期 TTL 的最大值（之后按周期逐个精筛）
+        max_ttl_min = max(list(_LEVEL_TTL_MINUTES.values()) + [int(self.max_age_h * 60)])
+        cutoff = (datetime.now() - timedelta(minutes=max_ttl_min)).strftime("%Y-%m-%d %H:%M:%S")
         try:
             with sqlite3.connect(SIGNALS_DB) as conn:
                 rows = conn.execute(
-                    "SELECT id, timeframe, direction, sig_type, grade, score, entry, sl, tp1, tp2, pushed_at"
-                    " FROM signals WHERE pushed_at >= ? ORDER BY id DESC LIMIT ?",
+                    "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.score,"
+                    " s.entry, s.sl, s.tp1, s.tp2, s.pushed_at, o.outcome"
+                    " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+                    " WHERE s.pushed_at >= ?"
+                    "   AND (o.outcome IS NULL OR o.outcome = 'open')"   # 已了结的不再盯
+                    " ORDER BY s.id DESC LIMIT ?",
                     (cutoff, LEVEL_MAX_SIGNALS),
                 ).fetchall()
         except Exception as e:
             log.error(f"[做单价位] 读取 signals.db 失败: {e}")
             return
 
-        lv, seen = [], set()
-        for (sid, tf, d, styp, grade, score, entry, sl, tp1, tp2, pushed_at) in rows:
+        now = datetime.now()
+        lv, seen, dropped = [], set(), []
+        for (sid, tf, d, styp, grade, score, entry, sl, tp1, tp2, pushed_at, outcome) in rows:
+            # 各周期独立有效期：5分钟周期的信号 3 小时后提醒已毫无意义
+            ttl_min = _LEVEL_TTL_MINUTES.get(tf, int(self.max_age_h * 60))
+            try:
+                age_min = (now - datetime.strptime(pushed_at, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+            except Exception:
+                age_min = 0.0
+            if age_min > ttl_min:
+                dropped.append(f"#{sid}{tf}超期{age_min:.0f}分")
+                continue
+            if entry is None or sl is None:
+                continue
+
             label = f"{tf} {'做多' if d > 0 else '做空'}"
             if styp:
                 label += f" [{styp}]"
@@ -205,11 +248,16 @@ class LevelWatcher:
                     "label": label, "entry": float(entry), "sl": float(sl),
                     "tp1": float(tp1) if tp1 is not None else None,
                     "tp2": float(tp2) if tp2 is not None else None,
-                    "direction": int(d),
+                    "direction": int(d), "dir": _trigger_dir(kind, int(d)),
                     "pushed_at": pushed_at,
                 })
         self.levels = lv
-        log.info(f"[做单价位] {len(rows)} 条近期信号 → 监控 {len(lv)} 个价位")
+        # 已触发的记录只保留仍在监控中的价位，避免无限增长
+        self.fired &= {l["id"] for l in lv}
+        msg = f"[做单价位] {len(rows)} 条未结案信号 → 监控 {len(lv)} 个价位"
+        if dropped:
+            msg += f" | 按周期过期剔除 {len(dropped)}: {', '.join(dropped[:4])}"
+        log.info(msg)
 
     def check(self, price: float):
         if not self.enabled:
@@ -226,9 +274,17 @@ class LevelWatcher:
             if l["id"] in self.fired:
                 continue
             p = l["price"]
-            if (p0 < p <= p1) or (p0 > p >= p1):   # 上穿或下穿
-                self.fired.add(l["id"])
-                self._alert(l, price)
+            if p0 < p <= p1:
+                crossed = 1        # 上穿
+            elif p0 > p >= p1:
+                crossed = -1       # 下穿
+            else:
+                continue
+            want = l.get("dir", 0)
+            if want and crossed != want:
+                continue           # 方向不符：做多的止盈不会在「下穿」时被触及
+            self.fired.add(l["id"])
+            self._alert(l, price)
         self.prev = price
 
     def _alert(self, l: dict, price: float):
@@ -249,13 +305,20 @@ class LevelWatcher:
             diff = (float(p) - e) * d
             return f"**{float(p):.2f}** ({diff:+.2f}, {diff / r:+.2f}R)"
 
+        # 信号距今多久 —— 提醒里显示新鲜度，避免用户以为是刚出的信号
+        try:
+            age_min = (datetime.now() - datetime.strptime(l["pushed_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+            age_txt = f"（{age_min:.0f} 分钟前）" if age_min < 120 else f"（{age_min / 60:.1f} 小时前）"
+        except Exception:
+            age_txt = ""
+
         lines = [
             f"> 触发价 **{l['price']:.2f}**  |  现价 **{price:.2f}**",
             f"> 🎯 入场 {e:.2f}",
             f"> 🛑 止损 {rel(sl)}",
             f"> ✅ TP1　{rel(l.get('tp1'))}",
             f"> 🏆 TP2　{rel(l.get('tp2'))}",
-            f"> 信号时间 {l['pushed_at']}",
+            f"> 信号时间 {l['pushed_at']}{age_txt}",
         ]
         log.info(f"[做单] 触发 {l['kind']} @ {l['price']:.2f} (现价 {price:.2f})")
         send_alert(title, "\n".join(lines) + "\n")
