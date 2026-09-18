@@ -292,9 +292,11 @@ async function load(){
       box.appendChild(E('div','name',tf));
       const add=(k,v)=>{const r=E('div','row');r.appendChild(E('span',null,k));r.appendChild(E('b',null,v));box.appendChild(r);};
       add('趋势', d.trend); add('收盘', d.close); add('RSI', d.rsi); add('ATR', d.atr);
+      if(d.adx!=null) add('ADX', `${d.adx}${d.adx>=25?' 强趋势':d.adx<20?' 偏弱':' 中等'}`);
+      if(d.fib_zone && d.fib_zone.length===2) add('斐波回撤区', `${d.fib_zone[0]} ~ ${d.fib_zone[1]}`);
       let sigTxt = d.signal===1?'🟢做多':d.signal===-1?'🔴做空':'—';
       if(d.signal!==0 && d.type) sigTxt += ` [${d.type}]`;
-      if(d.signal!==0 && d.grade) sigTxt += ` ${d.grade}级${d.score}/9`;
+      if(d.signal!==0 && d.grade) sigTxt += ` ${d.grade}级${d.score}/10`;
       add('信号', sigTxt);
       add('动能', d.vol_ok?'✓':'✗');
       add('K线时间', d.bar_time);
@@ -342,7 +344,7 @@ async function load(){
       top.appendChild(E('span','tfname', s.timeframe));
       top.appendChild(E('span', s.direction===1?'dir-long':'dir-short', s.direction===1?'🟢 做多':'🔴 做空'));
       if(s.sig_type) top.appendChild(E('span','muted', s.sig_type));
-      if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/9')));
+      if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/10')));
       if(s.resonance>=2) top.appendChild(E('span','fire','🔥共振'+s.resonance));
       top.appendChild(E('span','time', s.pushed_at||''));
       box.appendChild(top);

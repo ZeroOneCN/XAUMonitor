@@ -109,6 +109,10 @@ def load_config():
         # 斐波那契
         "fib_lookback": 50,            # 计算摆动高低点回看的K线数
         "show_fib": True,              # 做单卡片是否展示斐波那契回撤区/扩展目标
+        # ADX 趋势强度（信号逻辑精修）
+        "adx_len": 14,
+        "min_adx": 20,                 # 评分要求的最低 ADX（<20 视为震荡）
+        "min_adx_filter": 0,           # >0 时作为硬门槛：ADX 低于该值直接不推送
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(default, f, indent=2, ensure_ascii=False)
@@ -389,7 +393,37 @@ def calc_rsi(series: pd.Series, length: int = 14) -> pd.Series:
 # 交易频率预设：仅当 config 未显式提供对应参数时兜底
 _FIB_RETR = (0.382, 0.5, 0.618)     # 黄金回撤区
 _FIB_EXT = (1.272, 1.618)           # 扩展目标位
-_SCORE_MAX = 9                      # 信号满分（含斐波那契维度）
+_SCORE_MAX = 10                     # 信号满分（含斐波那契 + ADX 维度）
+
+
+def calc_adx(df: pd.DataFrame, length: int = 14):
+    """Wilder ADX / +DI / -DI。
+
+    ADX 衡量「趋势有多强」（与方向无关）：
+      - ADX < 20  → 震荡/黏合，均线排列常常是假信号
+      - ADX > 25  → 明确趋势
+    +DI/-DI 给出方向：+DI 在上 = 多头占优。
+
+    这是「信号逻辑精修」的关键——原策略只看 EMA 排列（滞后且易被黏合骗），
+    ADX 用真实的定向动量确认趋势是否值得跟。
+    """
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up = high.diff()
+    dn = -low.diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    alpha = 1.0 / length
+    atr_w = tr.ewm(alpha=alpha, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr_w
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr_w
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx, plus_di, minus_di
 
 
 def _grade_of(score: int, n: int = _SCORE_MAX) -> str:
@@ -498,6 +532,17 @@ def _score_signal(row, direction: int, mode: str, **extra) -> tuple:
     zone = _fib_zone(row, long, atr)
     if zone and zone[0] <= row["Close"] <= zone[1]:
         s += 1
+    # 10 ADX 趋势强度 + DI 方向一致性
+    #   （均线排列是滞后指标，ADX<阈值说明只是黏合震荡，DI 反向说明动能不支持）
+    adx = row.get("adx")
+    pdi, mdi = row.get("plus_di"), row.get("minus_di")
+    min_adx = extra.get("min_adx", 20)
+    if adx is not None and not np.isnan(adx) and adx >= min_adx:
+        di_ok = True
+        if pdi is not None and mdi is not None and not (np.isnan(pdi) or np.isnan(mdi)):
+            di_ok = (pdi > mdi) if long else (mdi > pdi)
+        if di_ok:
+            s += 1
     return s, _grade_of(s)
 
 
@@ -508,6 +553,7 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
     # config 显式参数优先，trade_freq 仅在缺省时兜底
     c = _apply_freq_preset(cfg)
+    min_adx = c.get("min_adx", 20)   # ADX 趋势强度门槛（精修项）
 
     df = df.copy()
     
@@ -523,6 +569,9 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
     # 斐波那契回撤/扩展位
     df = calc_fib(df, c.get("fib_lookback", 50))
+
+    # ADX 趋势强度（精修：区分「真趋势」与「均线黏合震荡」）
+    df["adx"], df["plus_di"], df["minus_di"] = calc_adx(df, c.get("adx_len", 14))
     
     # K线形态
     df["range"] = df["High"] - df["Low"]
@@ -775,7 +824,7 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
                 signals[i] = 1
                 signal_types[i] = "突破"
                 # 统一评分（0-8）
-                score, grade = _score_signal(df.iloc[i], 1, "突破")
+                score, grade = _score_signal(df.iloc[i], 1, "突破", min_adx=min_adx)
                 signal_grades[i] = grade
                 signal_scores[i] = score
                 signal_bands[i] = "突破"
@@ -786,7 +835,7 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
                 signals[i] = -1
                 signal_types[i] = "突破"
                 # 统一评分（0-8）
-                score, grade = _score_signal(df.iloc[i], -1, "突破")
+                score, grade = _score_signal(df.iloc[i], -1, "突破", min_adx=min_adx)
                 signal_grades[i] = grade
                 signal_scores[i] = score
                 signal_bands[i] = "突破"
@@ -843,6 +892,7 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
                         df.iloc[i], 1, "回踩",
                         pullback_depth=long_pullback_depth,
                         band_reason=long_band_reason,
+                        min_adx=min_adx,
                     )
                 elif long_confirm_window > pullback_confirm_bars:
                     state_long = 0
@@ -901,6 +951,7 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
                     short_signal_score, short_signal_grade = _score_signal(
                         df.iloc[i], -1, "回踩",
                         pullback_depth=short_pullback_depth,
+                        min_adx=min_adx,
                         band_reason=short_band_reason,
                     )
                 elif short_confirm_window > pullback_confirm_bars:
@@ -1155,6 +1206,15 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
         v1, v2 = row.get(k1), row.get(k2)
         if v1 is not None and v2 is not None and not np.isnan(v1) and not np.isnan(v2):
             lines.append(f"> 🎯 斐波扩展目标: {v1:.1f} / {v2:.1f}")
+    # ADX 趋势强度（精修项：判断是真趋势还是黏合震荡）
+    adx = row.get("adx")
+    if adx is not None and not np.isnan(adx):
+        strength = "强趋势" if adx >= 25 else ("偏弱/震荡" if adx < 20 else "中等")
+        pdi, mdi = row.get("plus_di"), row.get("minus_di")
+        di_txt = ""
+        if pdi is not None and mdi is not None and not (np.isnan(pdi) or np.isnan(mdi)):
+            di_txt = f"  +DI {pdi:.0f} / -DI {mdi:.0f}"
+        lines.append(f"> 📈 ADX **{adx:.0f}**（{strength}）{di_txt}")
     if ps and ps.get("ok"):
         lines.append(
             f"> 💰 **手数: {ps['lots']:.2f} 手**"
@@ -1484,6 +1544,12 @@ def _write_status(cfg: dict, results: dict):
                 "type": last.get("signal_type", ""),
                 "band": last.get("signal_band", ""),
                 "vol_ok": bool(last.get("vol_pass", True)),
+                "adx": round(float(last.get("adx", 0) or 0), 1),
+                "plus_di": round(float(last.get("plus_di", 0) or 0), 1),
+                "minus_di": round(float(last.get("minus_di", 0) or 0), 1),
+                "fib_zone": [
+                    round(float(z), 2) for z in (_fib_zone(last, bool(last["is_uptrend"]), last["atr"]) or ())
+                ],
             }
         p = _state_path(cfg.get("status_file", "dpb_status.json"))
         with open(p, "w", encoding="utf-8") as f:
@@ -1535,6 +1601,12 @@ def check_signals(cfg: dict, state: dict) -> dict:
             grade_now = last.get("signal_grade", "")
             if _GRADE_ORDER.get(grade_now, 0) < _GRADE_ORDER.get(min_grade, 0):
                 log.info(f"[过滤] {tf} {grade_now}级 低于门槛 {min_grade} → 跳过推送")
+                continue
+
+            # ADX 硬门槛（可选，min_adx_filter>0 时生效）：震荡行情直接不推
+            adx_gate = float(cfg.get("min_adx_filter", 0) or 0)
+            if adx_gate > 0 and float(last.get("adx", 0) or 0) < adx_gate:
+                log.info(f"[过滤] {tf} ADX {float(last.get('adx', 0) or 0):.1f} < {adx_gate} (震荡) → 跳过推送")
                 continue
 
             # 去重：同一周期同一方向不重复推送

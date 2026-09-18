@@ -78,5 +78,8 @@
   "fallback_sl_atr": 1.5,
   "outcome_max_age_days": 30,
   "fib_lookback": 50,
-  "show_fib": true
+  "show_fib": true,
+  "adx_len": 14,
+  "min_adx": 20,
+  "min_adx_filter": 0
 }
