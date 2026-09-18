@@ -1398,13 +1398,17 @@ def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars):
     return {"outcome": "open", "r": 0.0, "bars": len(bars), "mfe": mfe, "mae": mae}
 
 
-def evaluate_outcomes(cfg: dict, max_bars: int = 300) -> dict:
+def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> dict:
     """追踪已推送信号的实际结果（先碰 SL 还是 TP、最终 R 倍数）。
 
     没有这一层，任何参数调整都是盲猜——这是「验证闭环」的地基。
     按周期分组取数，同一周期只抓一次，节省 API 配额。
+
+    df_cache: check_signals 本轮已抓好的 {tf: df}。命中时**零额外 API 消耗**
+    （否则每轮会为每个周期再抓一次，把额度消耗翻倍）。
     """
     db_file = cfg.get("db_file", "signals.db")
+    df_cache = df_cache or {}
     max_age_days = int(cfg.get("outcome_max_age_days", 30))
     cutoff = (datetime.now() - timedelta(days=max_age_days)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1434,12 +1438,16 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300) -> dict:
         params = (cfg.get("timeframes") or {}).get(tf)
         if not params:
             continue
-        try:
-            ticker = cfg.get("ticker_td", cfg.get("ticker_av", cfg["ticker"]))
-            df = fetch_data(ticker, tf, params["interval"])
-        except Exception as e:
-            log.error(f"[追踪] {tf} 取数失败: {e}")
-            continue
+        # 优先复用本轮已抓好的数据（零 API 消耗）；只有缺失时才真正抓取
+        df = df_cache.get(tf)
+        if df is None:
+            try:
+                ticker = cfg.get("ticker_td", cfg.get("ticker_av", cfg["ticker"]))
+                df = fetch_data(ticker, tf, params["interval"])
+                log.info(f"[追踪] {tf} 缓存未命中，单独抓取一次")
+            except Exception as e:
+                log.error(f"[追踪] {tf} 取数失败: {e}")
+                continue
 
         for (sid, _tf, direction, entry, sl, tp1, tp2, r_size, ts) in sigs:
             try:
@@ -1561,11 +1569,15 @@ def _write_status(cfg: dict, results: dict):
 # ============================================================
 # 主循环
 # ============================================================
-def check_signals(cfg: dict, state: dict) -> dict:
+def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
     """检查所有周期的信号，返回更新后的状态。
 
     A4 改造：先算完所有周期，再按「同向周期数」判定多周期共振，
     推送时带 🔥 标记，帮助区分"单周期噪音"与"多周期共振"信号。
+
+    df_cache: 传入 dict 时，会把本轮已抓取并计算好的各周期 DataFrame 存进去，
+    供「结果追踪」直接复用 —— 否则结果追踪会为每个周期再抓一次数据，
+    在有信号追踪时把 API 消耗翻倍（3 key × 800/天 的额度扛不住）。
     """
     ticker = cfg.get("ticker_td", cfg.get("ticker_av", cfg["ticker"]))
     min_grade = cfg.get("min_signal_grade", "C")
@@ -1579,6 +1591,8 @@ def check_signals(cfg: dict, state: dict) -> dict:
             df = calc_signals(df, cfg)
             last = df.iloc[-1]
             results[tf] = (int(last["signal"]), last)
+            if df_cache is not None:
+                df_cache[tf] = df      # 复用给结果追踪，避免二次抓取
         except Exception as e:
             log.error(f"[错误] {tf} 检查失败: {e}")
 
@@ -1698,10 +1712,12 @@ def main():
         log.info(f"[启动] 循环监控模式, 间隔 {interval//60} 分钟")
         while True:
             try:
-                state = check_signals(cfg, state)
+                # 同一轮内共享已抓取的数据，避免结果追踪重复消耗 API 额度
+                df_cache = {}
+                state = check_signals(cfg, state, df_cache)
                 save_state(cfg["state_file"], state)
-                # 结果追踪：评估已推送信号的实际结果（验证闭环的地基）
-                evaluate_outcomes(cfg)
+                # 结果追踪：评估已推送信号的实际结果（验证闭环的地基，复用上面的数据 → 零额外消耗）
+                evaluate_outcomes(cfg, df_cache=df_cache)
                 st = outcome_stats(cfg.get("db_file", "signals.db"))
                 if st.get("closed"):
                     log.info(
