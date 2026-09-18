@@ -410,6 +410,11 @@ _FIB_RETR = (0.382, 0.5, 0.618)     # 黄金回撤区
 _FIB_EXT = (1.272, 1.618)           # 扩展目标位
 _SCORE_MAX = 10                     # 信号满分（含斐波那契 + ADX 维度）
 
+# 评分维度开关：由 calc_signals 依据 cfg 设置，供「减法验证」单独关闭某个维度，
+# 以便用回测回答「这个维度到底有没有贡献区分度」。
+#   cfg["use_fib_score"] / cfg["use_adx_score"]（默认都 True）
+_SCORE_FLAGS = {"use_fib": True, "use_adx": True}
+
 
 def calc_adx(df: pd.DataFrame, length: int = 14):
     """Wilder ADX / +DI / -DI。
@@ -544,21 +549,28 @@ def _score_signal(row, direction: int, mode: str, **extra) -> tuple:
     s += 1 if ((row["Close"] > row["ema50"]) if long else (row["Close"] < row["ema50"])) else 0
     # 9 斐波那契回撤区确认：入场落在 0.382~0.618 黄金回撤带
     #   （DPB 的「二次回踩」本质就是等价格回到支撑，和斐波那契回撤区天然同源）
-    zone = _fib_zone(row, long, atr)
-    if zone and zone[0] <= row["Close"] <= zone[1]:
-        s += 1
+    # 可用 use_fib=False 关闭（减法验证：该维度是否真的在贡献区分度）
+    use_fib = extra.get("use_fib", _SCORE_FLAGS["use_fib"])
+    use_adx = extra.get("use_adx", _SCORE_FLAGS["use_adx"])
+    if use_fib:
+        zone = _fib_zone(row, long, atr)
+        if zone and zone[0] <= row["Close"] <= zone[1]:
+            s += 1
     # 10 ADX 趋势强度 + DI 方向一致性
     #   （均线排列是滞后指标，ADX<阈值说明只是黏合震荡，DI 反向说明动能不支持）
-    adx = row.get("adx")
-    pdi, mdi = row.get("plus_di"), row.get("minus_di")
-    min_adx = extra.get("min_adx", 20)
-    if adx is not None and not np.isnan(adx) and adx >= min_adx:
-        di_ok = True
-        if pdi is not None and mdi is not None and not (np.isnan(pdi) or np.isnan(mdi)):
-            di_ok = (pdi > mdi) if long else (mdi > pdi)
-        if di_ok:
-            s += 1
-    return s, _grade_of(s)
+    if use_adx:
+        adx = row.get("adx")
+        pdi, mdi = row.get("plus_di"), row.get("minus_di")
+        min_adx = extra.get("min_adx", 20)
+        if adx is not None and not np.isnan(adx) and adx >= min_adx:
+            di_ok = True
+            if pdi is not None and mdi is not None and not (np.isnan(pdi) or np.isnan(mdi)):
+                di_ok = (pdi > mdi) if long else (mdi > pdi)
+            if di_ok:
+                s += 1
+    # 满分随启用的维度动态变化，等级门槛才能等比缩放（否则关掉维度会让等级整体上浮）
+    n_max = 8 + (1 if use_fib else 0) + (1 if use_adx else 0)
+    return s, _grade_of(s, n_max)
 
 
 def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -569,6 +581,10 @@ def calc_signals(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     # config 显式参数优先，trade_freq 仅在缺省时兜底
     c = _apply_freq_preset(cfg)
     min_adx = c.get("min_adx", 20)   # ADX 趋势强度门槛（精修项）
+
+    # 评分维度开关（减法验证用）：关掉某维度后满分随之下降，等级门槛等比缩放
+    _SCORE_FLAGS["use_fib"] = bool(c.get("use_fib_score", True))
+    _SCORE_FLAGS["use_adx"] = bool(c.get("use_adx_score", True))
 
     df = df.copy()
     

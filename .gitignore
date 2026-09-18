@@ -28,3 +28,4 @@ watchdog.log
 backtest_cache/
 backtest_full.log
 backtest_1d.log
+backtest_ablate_1h.log

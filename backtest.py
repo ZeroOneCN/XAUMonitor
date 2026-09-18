@@ -271,6 +271,51 @@ def report(s: dict, tf_infos: dict, title: str = ""):
             print(f"  {tf:<5s} {info}")
 
 
+def run_ablation(cfg: dict, tfs: list, min_grade: str | None = None) -> int:
+    """维度减法验证：关掉某个评分维度后，整体期望值变好还是变坏？
+
+    目的：回答「第 9/10 个维度（斐波那契、ADX）到底有没有贡献区分度」。
+    关掉维度后满分随之下降、等级门槛等比缩放，因此样本数会变化——
+    所以要同时看「全部等级」与「仅A级以上」两个口径。
+    """
+    variants = [
+        ("全部维度(基准)", {}),
+        ("去掉斐波那契", {"use_fib_score": False}),
+        ("去掉ADX", {"use_adx_score": False}),
+        ("只留前8维", {"use_fib_score": False, "use_adx_score": False}),
+    ]
+    print()
+    print("=" * 74)
+    print("维度减法验证 —— 每个评分类别到底有没有贡献区分度")
+    print("=" * 74)
+    for scope, grade in (("全部等级", min_grade), ("仅A级及以上", "A")):
+        print(f"\n  【{scope}】")
+        print(f"  {'方案':<16s} {'样本':>6s} {'胜率':>7s} {'净值R':>9s} {'期望值':>8s} {'盈亏因子':>8s}")
+        base_exp = None
+        for label, ov in variants:
+            c2 = dict(cfg)
+            c2.update(ov)
+            rows = []
+            for tf in tfs:
+                df = fetch_history(tf, c2)
+                if df.empty:
+                    continue
+                rows.extend(backtest_tf(df, tf, c2, min_grade=grade)["signals"])
+            st = summarize(rows)
+            if not st.get("n"):
+                print(f"  {label:<16s} {0:>6d}      —         —        —        —")
+                continue
+            if base_exp is None:
+                base_exp = st["expectancy"]
+            delta = st["expectancy"] - base_exp
+            mark = "" if ov == {} else (f"  ({delta:+.3f}R vs 基准)")
+            print(f"  {label:<16s} {st['n']:>6d} {st['win_rate']:>6.1f}% {st['net_r']:>+9.2f} "
+                  f"{st['expectancy']:>+8.3f} {st['profit_factor']:>8.2f}{mark}")
+    print()
+    print("  解读: 某方案期望值高于基准 → 该维度无贡献甚至在拖后腿，可考虑去掉")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="XAUMonitor 策略回测")
     ap.add_argument("--tf", nargs="*", default=None, help="指定周期，默认全部")
@@ -279,6 +324,8 @@ def main():
     ap.add_argument("--refresh", action="store_true", help="强制重拉历史")
     ap.add_argument("--csv", default=None, help="把每笔信号导出到 CSV")
     ap.add_argument("--sweep-grade", action="store_true", help="对比各等级门槛")
+    ap.add_argument("--ablate", action="store_true",
+                    help="维度减法验证：对比开/关斐波那契与ADX维度")
     args = ap.parse_args()
 
     cfg = m.load_config()
@@ -290,6 +337,9 @@ def main():
 
     print(f"[回测] 周期={tfs} | 等级门槛={args.min_grade or cfg.get('min_signal_grade')} "
           f"| 点差=${cfg.get('spread_usd', 0.2)}")
+
+    if args.ablate:
+        return run_ablation(cfg, tfs, args.min_grade)
 
     infos, all_rows, skipped = {}, [], 0
     for tf in tfs:
