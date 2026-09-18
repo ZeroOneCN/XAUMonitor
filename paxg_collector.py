@@ -69,6 +69,45 @@ _LEVEL_TTL_MINUTES = {
 }
 
 
+# ------------------------------------------------------------
+# 盘中触发的行情复核
+# ------------------------------------------------------------
+# 为什么必须有：信号是用 Twelve Data 的 XAU/USD 算的，但盘中触发盯的是
+# Binance PAXG/USDT —— 两个不同市场，PAXG 流动性差得多，会独立插针。
+# 实测事故：17:01:18 报「触发止损 4388.89」，当时 PAXG=4388.78，而真实
+# XAU/USD 最低 4392.32，离止损还差 3.24 美元；那一分钟的 PAXG 只有 3 笔成交。
+# 结果是用户收到假止损提醒（可能因此平掉好单）。
+# 所以触发前必须用「与信号同源」的行情复核一次。
+_xau_cache = {"t": 0.0, "df": None, "fail": 0}
+
+
+def _xau_confirm(kind: str, level: float, direction: int, lookback_min: int = 3) -> bool:
+    """用真实 XAU/USD 复核本次穿越。无法复核时返回 True（放行，宁可多报不漏报）。"""
+    now = time.time()
+    if _xau_cache["df"] is None or (now - _xau_cache["t"]) > 60:
+        try:
+            import dpb_monitor as mon           # 与信号引擎同源，保证口径一致
+            cfg = mon.load_config()
+            _xau_cache["df"] = mon.fetch_data(cfg.get("ticker_td", "XAU/USD"), "1m", "1min")
+            _xau_cache["t"] = now
+            _xau_cache["fail"] = 0
+        except Exception as e:
+            _xau_cache["fail"] += 1
+            log.warning(f"[做单] XAU/USD 复核取数失败({e}) → 本次按 PAXG 放行")
+            return True
+    try:
+        recent = _xau_cache["df"].tail(max(1, int(lookback_min)))
+        lo, hi = float(recent["Low"].min()), float(recent["High"].max())
+    except Exception:
+        return True
+
+    if kind == "止损":
+        return (lo <= level) if direction > 0 else (hi >= level)
+    if kind in ("TP1", "TP2"):
+        return (hi >= level) if direction > 0 else (lo <= level)
+    return lo <= level <= hi                    # 入场位：真实价格是否到过
+
+
 def _trigger_dir(kind: str, direction: int) -> int:
     """该价位允许的穿越方向：1=只允许上穿, -1=只允许下穿, 0=双向。
 
@@ -186,9 +225,14 @@ class LevelWatcher:
     价格盘中触及关键位时立刻提醒」，把 WS 的毫秒级精度变成做单价值。
     """
 
-    def __init__(self, enabled: bool = True, max_age_h: float = DEFAULT_ALERT_MAX_AGE_H):
+    def __init__(self, enabled: bool = True, max_age_h: float = DEFAULT_ALERT_MAX_AGE_H,
+                 confirm_xau: bool = True, confirm_lookback_min: int = 3):
         self.enabled = enabled
         self.max_age_h = max_age_h
+        # 触发前是否用真实 XAU/USD 复核（防 PAXG 独立插针误报）
+        self.confirm_xau = confirm_xau
+        self.confirm_lookback_min = confirm_lookback_min
+        self._false_logged = set()
         self.levels = []
         self.fired = self._load_fired()
         self.prev = None
@@ -304,6 +348,15 @@ class LevelWatcher:
             want = l.get("dir", 0)
             if want and crossed != want:
                 continue           # 方向不符：做多的止盈不会在「下穿」时被触及
+            # PAXG 独立插针复核：真实 XAU/USD 没到就不报（否则会误报止损/止盈）
+            if self.confirm_xau and not _xau_confirm(
+                    l["kind"], p, l.get("direction", 1), self.confirm_lookback_min):
+                if l["id"] not in self._false_logged:
+                    self._false_logged.add(l["id"])
+                    log.warning(
+                        f"[做单] 忽略 PAXG 假穿越: {l['kind']} @ {p:.2f} "
+                        f"(PAXG 现价 {price:.2f}, 真实 XAU/USD 未确认)")
+                continue
             self.fired.add(l["id"])
             self._save_fired()          # 落盘，重启后不会重发
             self._alert(l, price)
@@ -509,8 +562,13 @@ def main():
     watcher = LevelWatcher(
         enabled=(not args.no_alert) and bool(cfg.get("paxg_alert_enabled", True)),
         max_age_h=float(cfg.get("paxg_alert_max_age_hours", DEFAULT_ALERT_MAX_AGE_H)),
+        confirm_xau=bool(cfg.get("paxg_alert_confirm_xau", True)),
+        confirm_lookback_min=int(cfg.get("paxg_alert_confirm_lookback_min", 3)),
     )
     log.info(f"[配置] 做单数据推送: {'开启' if watcher.enabled else '关闭'} | 价位有效期 {watcher.max_age_h}h")
+    if watcher.enabled:
+        log.info(f"[配置] PAXG 假穿越复核: {'开启' if watcher.confirm_xau else '关闭'}"
+                 f"（用真实 XAU/USD 复核最近 {watcher.confirm_lookback_min} 分钟）")
 
     c = Collector(db_path, args.symbol, watcher=watcher)
 
