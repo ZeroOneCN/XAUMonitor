@@ -5,6 +5,8 @@ dpb_state.json
 # 运行数据（B8 信号库）
 signals.db
 *.db
+*.db-wal
+*.db-shm
 
 # 状态快照（B9 仪表盘）
 dpb_status.json

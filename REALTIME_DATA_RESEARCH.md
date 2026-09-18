@@ -103,3 +103,26 @@ TwelveData XAU/USD: 4338.96     → 价差仅 -0.03%
 3. 跑 1~2 天对比 WS 数据 vs Twelve Data 轮询数据，用实测决定是否切换
 
 > 全程可保持现有系统不动，零风险验证。
+
+---
+
+## 七、实施记录（2026-09-18）
+
+**已上线旁路采集器**（Binance PAXG/USDT）：
+
+| 项 | 说明 |
+|----|------|
+| 程序 | `paxg_collector.py`（独立进程，不碰 dpb_monitor） |
+| 服务 | `paxg-collector.service`（systemd，开机自启，崩溃自动重启） |
+| 库 | `paxg_stream.db`（SQLite WAL）—— 表：`trades` / `klines_1m` / `stream_events` |
+| 订阅 | `paxgusdt@trade` + `paxgusdt@kline_1m` |
+| 实测 | 连接延迟 12ms；成交约 **59 笔/分**；端到端延迟均值 **6.8ms**（-1~30ms） |
+
+### ⚠️ 附带发现的严重隐患：服务器时钟漂移 106 秒
+
+- **现象**：采集器首测显示延迟 106 秒 —— 排查发现服务器时钟比真实时间**快 106 秒**，
+  且 **NTP 服务未启用**（`System clock synchronized: no`）。
+- **影响**：不只是统计失真 —— **Binance 签名接口对时间偏差 >1 秒会直接拒绝(-1021)**，
+  你的 crypto-sword 实盘下单会受影响。
+- **已修复**：启用 `systemd-timesyncd`（开机自启），现与 Binance 服务器偏差 **-0.027 秒**。
+
