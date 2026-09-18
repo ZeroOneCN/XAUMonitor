@@ -81,5 +81,12 @@
   "show_fib": true,
   "adx_len": 14,
   "min_adx": 20,
-  "min_adx_filter": 0
+  "min_adx_filter": 0,
+  "fetch_ttl_minutes": {
+    "5m": 4,
+    "15m": 8,
+    "1h": 15,
+    "4h": 30,
+    "1d": 60
+  }
 }

@@ -113,6 +113,8 @@ def load_config():
         "adx_len": 14,
         "min_adx": 20,                 # 评分要求的最低 ADX（<20 视为震荡）
         "min_adx_filter": 0,           # >0 时作为硬门槛：ADX 低于该值直接不推送
+        # 各周期行情刷新间隔（分钟），省 API 额度；设为 {} 用内置默认
+        "fetch_ttl_minutes": {},       # 例 {"5m":4,"15m":8,"1h":15,"4h":30,"1d":60}
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(default, f, indent=2, ensure_ascii=False)
@@ -1569,6 +1571,15 @@ def _write_status(cfg: dict, results: dict):
 # ============================================================
 # 主循环
 # ============================================================
+# 各周期行情数据的刷新间隔（分钟）。高周期 K 线变化慢，
+# 每 4 分钟重拉一次纯属浪费额度：4h 的 K 线 4 小时才变一次。
+# 设为 0 表示每轮都抓（关闭该周期的缓存）。
+_FETCH_TTL_DEFAULTS = {
+    "5m": 4, "15m": 8, "1h": 15, "4h": 30, "1d": 60,
+}
+_fetch_cache = {}   # tf -> (抓取时间戳, 已算好信号的 DataFrame)
+
+
 def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
     """检查所有周期的信号，返回更新后的状态。
 
@@ -1578,23 +1589,39 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
     df_cache: 传入 dict 时，会把本轮已抓取并计算好的各周期 DataFrame 存进去，
     供「结果追踪」直接复用 —— 否则结果追踪会为每个周期再抓一次数据，
     在有信号追踪时把 API 消耗翻倍（3 key × 800/天 的额度扛不住）。
+
+    额度优化：按 _FETCH_TTL_DEFAULTS（可用 config 的 fetch_ttl_minutes 覆盖）
+    对每个周期设置刷新间隔，未到期的直接复用上一轮结果。
+    注意 calc_signals 是纯函数、每次都从完整 K 线序列重算，
+    所以复用不会丢状态机进度，只影响「新信号被发现的延迟」。
     """
     ticker = cfg.get("ticker_td", cfg.get("ticker_av", cfg["ticker"]))
     min_grade = cfg.get("min_signal_grade", "C")
     resonance_min = cfg.get("resonance_min_count", 2)
 
-    # ---- 阶段 1：抓取并计算所有周期 ----
+    # ---- 阶段 1：抓取并计算所有周期（按 TTL 决定是否复用缓存）----
+    ttl_map = cfg.get("fetch_ttl_minutes") or _FETCH_TTL_DEFAULTS
+    now = time.time()
     results = {}  # tf -> (sig, last_row)
+    reused_tfs, fetched_tfs = [], []
     for tf, params in cfg["timeframes"].items():
         try:
-            df = fetch_data(ticker, tf, params["interval"])
-            df = calc_signals(df, cfg)
+            ttl = float(ttl_map.get(tf, _FETCH_TTL_DEFAULTS.get(tf, 4)) or 0) * 60
+            hit = _fetch_cache.get(tf)
+            if ttl > 0 and hit and (now - hit[0]) < ttl:
+                df = hit[1]                       # 复用，零 API 消耗
+                reused_tfs.append(tf)
+            else:
+                df = calc_signals(fetch_data(ticker, tf, params["interval"]), cfg)
+                _fetch_cache[tf] = (now, df)
+                fetched_tfs.append(tf)
             last = df.iloc[-1]
             results[tf] = (int(last["signal"]), last)
             if df_cache is not None:
                 df_cache[tf] = df      # 复用给结果追踪，避免二次抓取
         except Exception as e:
             log.error(f"[错误] {tf} 检查失败: {e}")
+    log.info(f"[数据] 本轮抓取 {fetched_tfs or '无'} | 复用缓存 {reused_tfs or '无'}")
 
     # ---- 阶段 2：统计各方向信号所属周期（用于共振判定）----
     long_tfs = [tf for tf, (s, _) in results.items() if s == 1]
