@@ -21,3 +21,4 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/paxg_fired.json
+news_calendar.json

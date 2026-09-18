@@ -117,6 +117,13 @@ def load_config():
         "tp1_exit_pct": 0.5,           # TP1 了结的仓位比例，其余留到 TP2
         "be_after_tp1": True,          # TP1 后止损是否移到保本（剩余仓位按 0R 计）
         "outcome_max_bars": {},        # 各周期扫描窗口(根)，{} 用内置按周期默认
+        # 财经数据发布黑名单（动态拉取 ForexFactory 周历）
+        "news_filter_enabled": True,
+        "news_impact_levels": ["high"],        # high / medium / low
+        "news_currencies": ["USD"],            # 关注币种
+        "news_blackout_before_min": 30,        # 数据公布前多少分钟禁开新仓
+        "news_blackout_after_min": 30,         # 数据公布后多少分钟禁开新仓
+        "news_manual_blackouts": [],           # 手工窗口 [{"name","start","end"}]
         # 各周期行情刷新间隔（分钟），省 API 额度；设为 {} 用内置默认
         "fetch_ttl_minutes": {},       # 例 {"5m":4,"15m":8,"1h":15,"4h":30,"1d":60}
     }
@@ -1643,6 +1650,15 @@ def _write_status(cfg: dict, results: dict):
                     round(float(z), 2) for z in (_fib_zone(last, bool(last["is_uptrend"]), last["atr"]) or ())
                 ],
             }
+        # 数据发布窗口状态（供仪表盘展示；news_blackout 定义在本文件后面，
+        # 运行时才调用，前向引用没问题）
+        try:
+            blocked, ev_name, upcoming = news_blackout(cfg)
+            snap["news"] = {"blocked": bool(blocked), "event": ev_name,
+                            "upcoming": upcoming, "enabled": bool(cfg.get("news_filter_enabled", True))}
+        except Exception as e:
+            snap["news"] = {"blocked": False, "event": "", "upcoming": "",
+                            "enabled": True, "error": str(e)}
         p = _state_path(cfg.get("status_file", "dpb_status.json"))
         with open(p, "w", encoding="utf-8") as f:
             json.dump(snap, f, indent=2, ensure_ascii=False)
@@ -1660,6 +1676,146 @@ _FETCH_TTL_DEFAULTS = {
     "5m": 4, "15m": 8, "1h": 15, "4h": 30, "1d": 60,
 }
 _fetch_cache = {}   # tf -> (抓取时间戳, 已算好信号的 DataFrame)
+
+
+# ============================================================
+# 财经数据发布黑名单（重大数据前后禁止开新仓）
+# ============================================================
+# 为什么必须有：用户历史上两次爆仓，其中一次正是「06-05 非农插针」
+# （$680 → $0）。系统此前完全不认识非农/CPI/FOMC —— 而数据发布瞬间的插针
+# 能在一分钟内直接吃掉整个止损距离。
+#
+# 「动态」而不是把日期写死在代码里：每次自动拉取 ForexFactory 周历
+# （免费、无需 key），按 impact 等级 + 币种过滤后算出禁开仓窗口。
+# 源站故障时退回落盘缓存；两者都没有则放行（fail-open，宁可漏过也不误封全天）。
+NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_CACHE_FILE = Path(__file__).parent / "news_calendar.json"
+NEWS_TTL_SEC = 6 * 3600          # 6 小时刷新一次（周历每周更新）
+
+_news_cache = {"t": 0.0, "events": [], "err": "", "notified": ""}
+
+
+def _parse_news(raw, cfg: dict) -> list:
+    """过滤并解析日历：只保留关注币种 + 达到 impact 等级的事件"""
+    levels = {str(x).strip().lower() for x in (cfg.get("news_impact_levels") or ["high"])}
+    curr = {str(x).strip().upper() for x in (cfg.get("news_currencies") or ["USD"])}
+    out = []
+    for e in raw or []:
+        try:
+            if str(e.get("impact", "")).strip().lower() not in levels:
+                continue
+            if str(e.get("country", "")).strip().upper() not in curr:
+                continue
+            dt = datetime.fromisoformat(str(e["date"]))
+            out.append({
+                "title": e.get("title", ""), "country": e.get("country", ""),
+                "impact": e.get("impact", ""),
+                "dt": dt.isoformat(), "ts": dt.timestamp(),
+            })
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: x["ts"])
+
+
+def news_events(cfg: dict) -> list:
+    """取财经日历事件。远程 → 落盘缓存 → 空列表（fail-open）"""
+    now = time.time()
+    if _news_cache["events"] and (now - _news_cache["t"]) < NEWS_TTL_SEC:
+        return _news_cache["events"]
+
+    raw = None
+    try:
+        r = _session.get(NEWS_URL, timeout=15)
+        if r.status_code == 200:
+            raw = r.json()
+        else:
+            _news_cache["err"] = f"HTTP {r.status_code}"
+    except Exception as e:
+        _news_cache["err"] = str(e)
+
+    if raw is not None:
+        evs = _parse_news(raw, cfg)
+        _news_cache.update({"t": now, "events": evs, "err": ""})
+        try:      # 落盘：源站故障时仍能保护
+            NEWS_CACHE_FILE.write_text(
+                json.dumps({"fetched_at": now, "events": evs}, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+        log.info(f"[新闻] 财经日历已更新: {len(evs)} 个待规避事件")
+        return evs
+
+    try:          # 远程失败 → 落盘缓存
+        d = json.loads(NEWS_CACHE_FILE.read_text(encoding="utf-8"))
+        evs = d.get("events") or []
+        if evs:
+            _news_cache.update({"t": now, "events": evs})
+            log.warning(f"[新闻] 远程日历取数失败({_news_cache['err']})，"
+                        f"使用落盘缓存 {len(evs)} 个事件")
+            return evs
+    except Exception:
+        pass
+
+    _news_cache.update({"t": now, "events": []})
+    log.warning(f"[新闻] 财经日历不可用({_news_cache['err']})，本次不做数据窗口过滤")
+    _notify_news_down(cfg)
+    return []
+
+
+def _notify_news_down(cfg: dict):
+    """日历取不到时告警一次（每天一次），避免保护静默失效无人知晓"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _news_cache.get("notified") == today:
+        return
+    _news_cache["notified"] = today
+    try:
+        send_alert(cfg, "⚠️ 财经日历不可用",
+                   f"> 数据发布黑名单**暂时失效**\n"
+                   f"> 原因: {_news_cache['err']}\n"
+                   f"> 影响: 非农/CPI/FOMC 等窗口内仍会正常推送信号\n"
+                   f"> 时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    except Exception:
+        pass
+
+
+def news_blackout(cfg: dict):
+    """当前是否处于数据发布禁开仓窗口 → (是否禁用, 事件名, 下一事件描述)
+
+    窗口 = 事件时间 ± news_blackout_before/after_min（默认 30/30 分钟）。
+    另支持 news_manual_blackouts 手工加一次性窗口（可配置）。
+    """
+    if not cfg.get("news_filter_enabled", True):
+        return False, "", ""
+    now_ts = time.time()
+    before = int(cfg.get("news_blackout_before_min", 30)) * 60
+    after = int(cfg.get("news_blackout_after_min", 30)) * 60
+
+    # 手工一次性窗口（可配置）：[{"name":"非农","start":"2026-10-02 20:30","end":"2026-10-02 21:30"}]
+    for m in (cfg.get("news_manual_blackouts") or []):
+        try:
+            s = datetime.strptime(str(m["start"]), "%Y-%m-%d %H:%M").timestamp()
+            e = datetime.strptime(str(m["end"]), "%Y-%m-%d %H:%M").timestamp()
+            if s <= now_ts <= e:
+                return True, m.get("name", "手工窗口"), ""
+        except Exception:
+            continue
+
+    evs = news_events(cfg)
+    if not evs:
+        return False, "", ""
+
+    upcoming = ""
+    for ev in evs:
+        ts = float(ev["ts"])
+        if ts + after < now_ts:
+            continue                      # 已过去
+        if not upcoming:
+            mins = (ts - now_ts) / 60
+            when = "刚刚" if mins < 0 else f"{mins:.0f}分钟后"
+            upcoming = f"{ev['title']} ({ev['country']}) {when}"
+        if ts - before <= now_ts <= ts + after:
+            return True, f"{ev['title']} ({ev['country']})", upcoming
+    return False, "", upcoming
 
 
 def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
@@ -1752,6 +1908,15 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
             # 打开后单周期孤立信号不再推送，显著降低噪音）
             if cfg.get("require_resonance", False) and not res_tfs:
                 log.info(f"[过滤] {tf} 无多周期共振(需≥{resonance_min}个同向) → 跳过推送")
+                continue
+
+            # 数据发布黑名单：重大数据前后不开新仓
+            # （用户历史爆仓之一正是 06-05 非农插针 $680→$0）
+            blocked, ev_name, _upcoming = news_blackout(cfg)
+            if blocked:
+                state[key] = last.name.isoformat()
+                log.info(f"[新闻] ⛔ 处于数据发布窗口「{ev_name}」→ 不推送 "
+                         f"{tf} {'多' if sig > 0 else '空'}单")
                 continue
 
             title, content = format_signal_msg(tf, sig, last, cfg, resonance_tfs=res_tfs)

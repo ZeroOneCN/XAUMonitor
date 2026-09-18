@@ -90,5 +90,15 @@
     "1d": 60
   },
   "tp1_exit_pct": 0.5,
-  "be_after_tp1": true
+  "be_after_tp1": true,
+  "news_filter_enabled": true,
+  "news_impact_levels": [
+    "high"
+  ],
+  "news_currencies": [
+    "USD"
+  ],
+  "news_blackout_before_min": 30,
+  "news_blackout_after_min": 30,
+  "news_manual_blackouts": []
 }
