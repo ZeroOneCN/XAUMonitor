@@ -19,8 +19,12 @@ dpb_signals.txt
 # Python
 __pycache__/
 *.py[cod]
+# 虚拟环境：.venv/ 和 venv/ 两种写法都必须挡（本目录实际用的是 venv/）
+# ⚠️ 曾经只写了 .venv/ 导致 git add -A 把 3605 个 venv 文件推上 GitHub，
+#    事后靠 amend + force-push 才清理掉。改动此处务必两种都保留。
 .venv/
-venv/paxg_fired.json
+venv/
+
 news_calendar.json
 dpb_heartbeat.txt
 watchdog_state.json
@@ -30,3 +34,8 @@ backtest_full.log
 backtest_1d.log
 backtest_ablate_1h.log
 backtest_signif.log
+archive/
+paxg_fired.json
+*.bak
+*.bak.*
+dpb_config.json.*

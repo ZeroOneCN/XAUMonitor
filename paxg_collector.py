@@ -23,6 +23,8 @@
 """
 import argparse
 import asyncio
+import csv
+import gzip
 import json
 import logging
 import signal
@@ -54,6 +56,7 @@ CONFIG_FILE = BASE / "dpb_config.json"       # 复用监控的配置(取 webhook
 SIGNALS_DB = BASE / "signals.db"             # 复用监控的信号库
 FIRED_FILE = BASE / "paxg_fired.json"        # 已触发价位记录（持久化，避免重启后重发）
 LEVEL_RELOAD_SECS = 60                       # 重新加载监控价位的间隔
+MAINTAIN_SECS = 86400                        # 数据库归档自维护间隔（每日一次）
 LEVEL_MAX_SIGNALS = 20                       # 最多盯最近多少条信号
 DEFAULT_ALERT_MAX_AGE_H = 24                 # 信号超过多少小时不再盯（兜底）
 
@@ -183,6 +186,96 @@ def log_event(db_path: Path, kind: str, detail: str):
 # ============================================================
 # 做单数据推送：实时盯住 signals.db 里信号的可执行价位
 # ============================================================
+# ============================================================
+# 数据库归档与清理（P2-10）
+# ============================================================
+# 为什么必须：trades 表约 0.5 条/秒 → 每天约 4 万条、一年 1500 万条。
+# 不清理会让库无限膨胀、查询退化、备份变慢、磁盘吃紧。
+#
+# 策略：只归档「整月且已完全过期」的数据 —— 每个月的数据只会被写入一次文件，
+# 重复执行不会重复归档（幂等）。归档为按月分片的 .csv.gz，日后可解压回灌。
+# 最后尝试 VACUUM 回收空间（可能因采集器并发写而失败，容忍并记录）。
+ARCHIVE_DIR = BASE / "archive"
+
+
+def _next_month(y: int, m: int) -> datetime:
+    """返回下一个月的 1 号（用于判断某月是否已完全过去）"""
+    return datetime(y + (1 if m == 12 else 0), 1 if m == 12 else m + 1, 1)
+
+
+def maintain_db(cfg: dict, db_path=None, dry_run: bool = False) -> dict:
+    """归档 + 清理 paxg_stream.db，返回统计信息。"""
+    db = Path(db_path or cfg.get("paxg_db_file", DEFAULT_DB))
+    trades_days = float(cfg.get("paxg_trades_retention_days", 30))
+    klines_days = float(cfg.get("paxg_klines_retention_days", 180))
+    now = datetime.now()
+    stat = {"archived": {}, "vacuum": "", "size_before": 0, "size_after": 0}
+    if not db.exists():
+        return stat
+    stat["size_before"] = db.stat().st_size
+    try:
+        conn = sqlite3.connect(str(db), timeout=30)
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception as e:
+        log.error(f"[归档] 打开库失败: {e}")
+        return stat
+    try:
+        for table, tscol, days in (("trades", "ts_ms", trades_days),
+                                   ("klines_1m", "open_ms", klines_days)):
+            cutoff = now - timedelta(days=days)
+            yms = [r[0] for r in conn.execute(
+                f"SELECT DISTINCT strftime('%Y-%m', {tscol}/1000, 'unixepoch') AS ym"
+                f" FROM {table} ORDER BY ym") if r[0]]
+            for ym in yms:
+                y, m = int(ym[:4]), int(ym[5:7])
+                if _next_month(y, m) > cutoff:
+                    continue                      # 该月尚未完全过期 → 下次再归档
+                rows = conn.execute(
+                    f"SELECT * FROM {table}"
+                    f" WHERE strftime('%Y-%m', {tscol}/1000, 'unixepoch') = ?"
+                    f" ORDER BY {tscol}", (ym,)).fetchall()
+                if not rows:
+                    continue
+                if dry_run:
+                    log.info(f"[归档][试运行] {table} {ym}: {len(rows)} 行（未写入）")
+                    continue
+                cols = [d[0] for d in conn.execute(
+                    f"SELECT * FROM {table} LIMIT 0").description]
+                ARCHIVE_DIR.mkdir(exist_ok=True)
+                fp = ARCHIVE_DIR / f"{table}_{ym}.csv.gz"
+                is_new = not fp.exists()
+                with gzip.open(fp, "at", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    if is_new:
+                        w.writerow(cols)
+                    w.writerows(rows)
+                conn.execute(
+                    f"DELETE FROM {table}"
+                    f" WHERE strftime('%Y-%m', {tscol}/1000, 'unixepoch') = ?", (ym,))
+                conn.commit()
+                stat["archived"][f"{table}_{ym}"] = len(rows)
+                log.info(f"[归档] {table} {ym}: {len(rows)} 行 → {fp.name}")
+        if not dry_run:
+            try:
+                conn.execute("VACUUM")
+                stat["vacuum"] = "ok"
+            except Exception as e:
+                stat["vacuum"] = f"跳过({type(e).__name__}: {e})"
+    except Exception as e:
+        log.error(f"[归档] 执行失败: {e}")
+    finally:
+        conn.close()
+    try:
+        stat["size_after"] = db.stat().st_size
+    except Exception:
+        pass
+    if stat["archived"] or stat["vacuum"]:
+        log.info(f"[归档] 完成: 归档 {sum(stat['archived'].values())} 行, "
+                 f"库 {stat['size_before']/1e6:.1f}MB → {stat['size_after']/1e6:.1f}MB, "
+                 f"vacuum={stat['vacuum']}")
+    return stat
+
+
 def _load_cfg() -> dict:
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -226,8 +319,11 @@ class LevelWatcher:
     """
 
     def __init__(self, enabled: bool = True, max_age_h: float = DEFAULT_ALERT_MAX_AGE_H,
-                 confirm_xau: bool = True, confirm_lookback_min: int = 3):
+                 confirm_xau: bool = True, confirm_lookback_min: int = 3,
+                 db_path=None):
         self.enabled = enabled
+        self.db_path = Path(db_path) if db_path else DEFAULT_DB
+        self.last_maintain = 0.0        # 0 → 启动后第一轮就做一次自维护，之后每日一次
         self.max_age_h = max_age_h
         # 触发前是否用真实 XAU/USD 复核（防 PAXG 独立插针误报）
         self.confirm_xau = confirm_xau
@@ -331,6 +427,14 @@ class LevelWatcher:
         if now - self.last_reload >= LEVEL_RELOAD_SECS:
             self._reload()
             self.last_reload = now
+        # 每日自维护：归档过期数据。放在采集器进程内执行 → 不与 WS 写入抢库锁，
+        # 比外部 cron 更安全（VACUUM 需要独占，跨进程常因 busy 失败）。
+        if now - self.last_maintain >= MAINTAIN_SECS:
+            self.last_maintain = now
+            try:
+                maintain_db(_load_cfg(), self.db_path)
+            except Exception as e:
+                log.error(f"[归档] 自维护失败: {e}")
         if self.prev is None:
             self.prev = price
             return
@@ -553,17 +657,29 @@ def main():
     ap.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Binance 交易对(小写), 默认 paxgusdt")
     ap.add_argument("--db", default=str(DEFAULT_DB), help="SQLite 库路径")
     ap.add_argument("--no-alert", action="store_true", help="关闭做单数据推送")
+    ap.add_argument("--maintain", action="store_true",
+                    help="只做数据库归档清理然后退出（供手工/cron 调用）")
+    ap.add_argument("--maintain-dry-run", action="store_true",
+                    help="配合 --maintain：只统计不写入")
     args = ap.parse_args()
 
     db_path = Path(args.db)
     init_db(db_path)
 
     cfg = _load_cfg()
+
+    # 归档模式：不进 WS 采集循环，执行完就退出
+    if args.maintain:
+        log.info(f"[归档] 手工模式 | 库={db_path} | 试运行={args.maintain_dry_run}")
+        st = maintain_db(cfg, db_path, dry_run=args.maintain_dry_run)
+        log.info(f"[归档] 结果: {st}")
+        return
     watcher = LevelWatcher(
         enabled=(not args.no_alert) and bool(cfg.get("paxg_alert_enabled", True)),
         max_age_h=float(cfg.get("paxg_alert_max_age_hours", DEFAULT_ALERT_MAX_AGE_H)),
         confirm_xau=bool(cfg.get("paxg_alert_confirm_xau", True)),
         confirm_lookback_min=int(cfg.get("paxg_alert_confirm_lookback_min", 3)),
+        db_path=db_path,
     )
     log.info(f"[配置] 做单数据推送: {'开启' if watcher.enabled else '关闭'} | 价位有效期 {watcher.max_age_h}h")
     if watcher.enabled:

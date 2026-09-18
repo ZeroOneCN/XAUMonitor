@@ -119,6 +119,12 @@ def load_config():
         "outcome_max_bars": {},        # 各周期扫描窗口(根)，{} 用内置按周期默认
         # 点差成本（下单即付，一进一出按一个点差计；0 = 不扣）
         "spread_usd": 0.2,
+        # PAXG 真实成交量（仅信息展示，不参与打分 —— 见 paxg_volume_ratio 说明）
+        "use_paxg_volume": True,
+        "paxg_volume_min_bars": 5,      # 均量样本少于此值就不显示（避免噪音）
+        # PAXG 旁路库归档（paxg_collector 每日自维护执行）
+        "paxg_trades_retention_days": 30,
+        "paxg_klines_retention_days": 180,
         # 财经数据发布黑名单（动态拉取 ForexFactory 周历）
         "news_filter_enabled": True,
         "news_impact_levels": ["high"],        # high / medium / low
@@ -1273,6 +1279,24 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
                 f"> ⚠️ 止损偏紧：点差 ${_spread:.2f} 占 **{_cost_r * 100:.1f}% R**"
                 f" → 净 TP1 {r1 - _cost_r:+.2f}R / 净 TP2 {r2 - _cost_r:+.2f}R"
             )
+    # PAXG 真实成交量：只做信息展示，【不参与打分】。
+    # 理由见 paxg_volume_ratio 顶部说明：稀薄市场 + 历史太短 → 无法验证，
+    # 消融实验已证明「未经验证的维度不应盲加」。
+    try:
+        _pv = paxg_volume_ratio(cfg, tf)
+    except Exception:
+        _pv = None
+    if _pv:
+        if _pv["ratio"] >= 1.5:
+            _tag = "明显放量 ✅"
+        elif _pv["ratio"] <= 0.6:
+            _tag = "缩量 ⚠️"
+        else:
+            _tag = "量能持平"
+        lines.append(
+            f"> 📊 PAXG真实量能 {_pv['ratio']:.2f}×（{_tag}，对比 {_pv['bars']} 根均量，"
+            f"{_pv['trades']}笔/${_pv['quote']:.0f}）"
+        )
     if resonance:
         lines.append(f"> 🔥 **多周期共振**({len(resonance_tfs)}个): {', '.join(resonance_tfs)}")
     lines.append(f"> {row.name.strftime('%H:%M')}")
@@ -1289,6 +1313,87 @@ def _state_path(state_file: str) -> Path:
     if p.is_absolute():
         return p
     return Path(__file__).parent / p
+
+
+# ============================================================
+# PAXG 真实成交量（P2-7）
+# ============================================================
+# 为什么需要：现货金（XAU/USD）**没有成交量字段**，所以 A1 只能用
+# 「K线实体/ATR > 0.6」做「放量」的代理。PAXG（币安）有真实成交量，
+# 是本项目唯一能拿到的真实量能数据 —— 它比自造的代理指标更接近事实。
+#
+# ⚠️ 诚实的前提说明（必须写清，否则会被误用为「黄金量能」）：
+#   1. PAXG 是稀薄市场：实测每分钟仅 $6k–20k、18–40 笔，
+#      单笔大单就能让量能飙升 → 它只是黄金量能的【代理】，不是真身。
+#   2. PAXG 采集器才上线，1m 历史有限；高周期（4h/1d）短期内算不出滚动均量。
+#   3. 因此本维度**只做信息展示，未接入评分**。要升级为评分维度需两个前提：
+#      a) 采集器积累足够历史（5m 需 ≥2h、1h 需 ≥21h、1d 需 ≥21 天）才能回测验证；
+#      b) calc_signals(df, cfg) 目前**拿不到周期名**，接入评分需把 tf 穿透进去
+#         —— 那是动实盘主路径的改动，不该为了一个未经验证的维度去做。
+#      在此之前，把它显示在卡片上让人自己判断，比让它悄悄改变等级更安全。
+PAXG_DB = Path(__file__).parent / "paxg_stream.db"
+_TF_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+_paxg_vol_cache = {"t": 0.0, "key": "", "val": None}
+PAXG_VOL_TTL = 30          # 秒；同一轮内多次取用不重复查库
+
+
+def paxg_volume_ratio(cfg: dict, tf: str, n_bars: int = 20):
+    """PAXG 相对成交量：当根成交量 / 之前 n 根均值。
+
+    1 = 与近期持平，>1.5 = 明显放量，<0.6 = 缩量。
+    数据不足（采集器刚上线）时返回 None —— 绝不猜。
+    """
+    if not cfg.get("use_paxg_volume", True):
+        return None
+    tf_min = _TF_MINUTES.get(tf)
+    if not tf_min or not PAXG_DB.exists():
+        return None
+    # 缓存键必须包含 min_bars —— 否则改门槛后会命中旧缓存、绕开检查
+    min_bars = int(cfg.get("paxg_volume_min_bars", 5))
+    key = f"{tf}:{n_bars}:{min_bars}"
+    now = time.time()
+    if (_paxg_vol_cache["key"] == key and _paxg_vol_cache["val"] is not None
+            and now - _paxg_vol_cache["t"] < PAXG_VOL_TTL):
+        return _paxg_vol_cache["val"]
+    need = tf_min * (n_bars + 2)
+    try:
+        with sqlite3.connect(PAXG_DB) as conn:
+            rows = conn.execute(
+                "SELECT open_ms, volume, quote_volume, trades FROM klines_1m"
+                " WHERE closed = 1 ORDER BY open_ms DESC LIMIT ?", (need,)).fetchall()
+    except Exception:
+        return None
+    if len(rows) < tf_min * 2:
+        return None
+    rows.reverse()
+    bucket_ms = tf_min * 60000
+    buckets = {}                      # 桶起始 → [分钟数, 量, 成交额, 笔数]
+    for ms, vol, qvol, nt in rows:
+        b = (ms // bucket_ms) * bucket_ms
+        d = buckets.setdefault(b, [0, 0.0, 0.0, 0])
+        d[0] += 1
+        d[1] += vol or 0.0
+        d[2] += qvol or 0.0
+        d[3] += nt or 0
+    # 只保留「分钟数完整」的桶 —— 否则正在形成的当根会被低估
+    full = sorted(k for k, v in buckets.items() if v[0] >= tf_min)
+    if len(full) < 3:
+        return None
+    vols = [buckets[k][1] for k in full]
+    cur = vols[-1]
+    prior = vols[:-1][-n_bars:]
+    # 均值样本太少时不给数 —— 拿 2 根K线算出的「相对量」纯属噪音，
+    # 报出来比不报更糟（会让人误以为「缩量 0.47×」是真实信号）
+    if len(prior) < min_bars:
+        return None
+    avg = sum(prior) / len(prior)
+    if avg <= 0:
+        return None
+    val = {"ratio": cur / avg, "vol": cur, "avg": avg, "bars": len(prior),
+           "bar_time": datetime.fromtimestamp(full[-1] / 1000).strftime("%m-%d %H:%M"),
+           "quote": buckets[full[-1]][2], "trades": buckets[full[-1]][3]}
+    _paxg_vol_cache.update({"t": now, "key": key, "val": val})
+    return val
 
 
 def load_state(state_file: str) -> dict:
