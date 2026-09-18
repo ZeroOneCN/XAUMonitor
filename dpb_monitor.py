@@ -92,6 +92,14 @@ def load_config():
         "breakout_sl_atr": 1.5,   # 突破模式固定 ATR 止损倍数
         "use_trend_cooldown": True,
         "trend_cooldown_bars": 5,
+        # 做单策略：仓位管理（把「下多少手」变成信号的一部分）
+        "use_position_sizing": True,
+        "account_equity": 1000,        # 账户资金
+        "risk_per_trade_pct": 1.0,     # 单笔风险占总资金 %
+        "contract_oz": 100,            # 黄金 1 标准手 = 100 盎司（每$1波动=$100/手）
+        "min_lot": 0.01,               # 最小可下单手数
+        "max_lot": 10.0,               # 手数安全上限（防手滑重仓）
+        "require_resonance": False,    # 是否只推送「多周期共振」的信号
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(default, f, indent=2, ensure_ascii=False)
@@ -911,6 +919,60 @@ def send_alert(cfg: dict, title: str, content: str) -> bool:
     return ok
 
 
+def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
+    """按「账户资金 × 单笔风险%」与止损距离计算建议手数。
+
+    黄金 1 标准手 = contract_oz 盎司（默认 100），价格每变动 $1
+    对应盈亏 = contract_oz 美元。于是：
+
+        风险金额 = 账户资金 × 单笔风险%
+        手数     = 风险金额 / (|入场 - 止损| × contract_oz)
+
+    这是「做单策略」最关键的一环：把下单量从手感/情绪，变成可计算的数字。
+    两轮爆仓的根因都是「方向看对但仓位远超账户承受」——本函数直接堵住它。
+
+    当按风险%算出的手数低于最小手数时，标记 undersized 并在推送里明说
+    「止损过宽 / 账户偏小」，而不是让用户稀里糊涂下重仓。
+    """
+    equity = float(cfg.get("account_equity", 1000) or 0)
+    risk_pct = float(cfg.get("risk_per_trade_pct", 1.0) or 0)
+    contract_oz = float(cfg.get("contract_oz", 100) or 0)
+    min_lot = float(cfg.get("min_lot", 0.01) or 0)
+    max_lot = float(cfg.get("max_lot", 10.0) or 0)
+
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0 or contract_oz <= 0 or equity <= 0:
+        return {"ok": False, "reason": "参数无效"}
+
+    risk_amount = equity * risk_pct / 100.0
+    raw_lots = risk_amount / (sl_dist * contract_oz)
+
+    # 注意：必须用「未取整」的手数判断是否低于最小手数，
+    # 否则 0.0069 手会被四舍五入成 0.01 而逃过「止损过宽」告警。
+    capped = None
+    if raw_lots < min_lot:
+        lots = min_lot
+        capped = "undersized"     # 想按风险%下也下不了 → 止损过宽 / 账户偏小
+    else:
+        lots = round(raw_lots, 2)
+        if max_lot > 0 and lots > max_lot:
+            lots = max_lot
+            capped = "capped"     # 安全上限截断
+
+    return {
+        "ok": True,
+        "lots": lots,
+        "raw_lots": raw_lots,
+        "risk_amount": risk_amount,       # 按风险%应承担
+        "actual_risk": lots * sl_dist * contract_oz,  # 实际下单后的风险
+        "sl_dist": sl_dist,
+        "risk_pct": risk_pct,
+        "equity": equity,
+        "capped": capped,
+        "point_value": contract_oz,
+    }
+
+
 def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
     """统一计算止损/止盈，返回 (entry, sl, r_size, r1, r2, tp1, tp2)。
     原逻辑在 format_signal_msg 与 check_signals 中重复，抽成单一来源避免漂移。"""
@@ -950,9 +1012,13 @@ def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
 
 
 def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance_tfs=None) -> tuple:
-    """格式化信号消息，返回 (title, content)。
-    resonance_tfs: 同向共振的周期列表；>=2 时加 🔥 共振标记。"""
-    entry, sl, _r_size, r1, r2, tp1, tp2 = calc_sl_tp(signal, row, cfg, tf)
+    """格式化「做单卡片」，返回 (title, content)。
+
+    除入场/止损/止盈外，新增仓位管理信息（建议手数 + 风险金额），
+    让信号从「看方向」升级为「可直接照着下单」。
+    resonance_tfs: 同向共振的周期列表；>=2 时加 🔥 共振标记。
+    """
+    entry, sl, r_size, r1, r2, tp1, tp2 = calc_sl_tp(signal, row, cfg, tf)
 
     # 方向标签
     d = "多" if signal > 0 else "空"
@@ -960,7 +1026,11 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
     grade = row.get("signal_grade", "")
     resonance = bool(resonance_tfs) and len(resonance_tfs) >= 2
 
-    # 标题：一眼看到方向+周期+价格（手机通知预览可见）
+    # 做单策略：仓位管理
+    ps = calc_position_size(entry, sl, cfg) if cfg.get("use_position_sizing", True) else None
+    lot_txt = f" {ps['lots']:.2f}手" if ps and ps.get("ok") else ""
+
+    # 标题：手机通知预览里就能看到 方向/周期/价格/手数/止损止盈
     title = f"{'🟢' if signal > 0 else '🔴'}{d} {tf} {entry:.2f}"
     if sig_type:
         title += f"[{sig_type}]"
@@ -968,20 +1038,29 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
         title += f"[{grade}]"
     if resonance:
         title = "🔥" + title
-    title += f" SL:{sl:.2f} TP1:{tp1:.2f}"
+    title += f"{lot_txt} SL:{sl:.2f} TP1:{tp1:.2f}"
 
-    # 内容：补充TP2与共振信息
-    content = (
-        f"> 入场: **{entry:.2f}**\n"
-        f"> 止损: **{sl:.2f}**\n"
-        f"> TP1: **{tp1:.2f}**\n"
-        f"> TP2: **{tp2:.2f}**\n"
-    )
+    # 内容：完整做单卡片
+    lines = [
+        f"> 入场: **{entry:.2f}**",
+        f"> 止损: **{sl:.2f}**  (距离 {r_size:.2f})",
+        f"> TP1: **{tp1:.2f}**  ({r1}R)",
+        f"> TP2: **{tp2:.2f}**  ({r2}R)",
+    ]
+    if ps and ps.get("ok"):
+        lines.append(
+            f"> 💰 **建议手数: {ps['lots']:.2f} 手**"
+            f" | 风险 ${ps['actual_risk']:.2f} ({ps['risk_pct']:.1f}% / ${ps['equity']:.0f})"
+        )
+        if ps["capped"] == "undersized":
+            lines.append(f"> ⚠️ 止损偏宽：按风险%仅需 {ps['raw_lots']:.4f} 手，已按最小 {ps['lots']:.2f} 手计")
+        elif ps["capped"] == "capped":
+            lines.append(f"> ⚠️ 已达手数上限，按 {ps['lots']:.2f} 手截断")
     if resonance:
-        content += f"> 🔥 **多周期共振**({len(resonance_tfs)}个): {', '.join(resonance_tfs)}\n"
-    content += f"> {row.name.strftime('%H:%M')}"
+        lines.append(f"> 🔥 **多周期共振**({len(resonance_tfs)}个): {', '.join(resonance_tfs)}")
+    lines.append(f"> {row.name.strftime('%H:%M')}")
 
-    return title, content
+    return title, "\n".join(lines) + "\n"
 
 
 # ============================================================
@@ -1158,6 +1237,12 @@ def check_signals(cfg: dict, state: dict) -> dict:
             same_tfs = long_tfs if sig > 0 else short_tfs
             res_tfs = same_tfs if len(same_tfs) >= resonance_min else None
 
+            # 做单策略：可选「只做多周期共振」硬门槛（默认关闭，
+            # 打开后单周期孤立信号不再推送，显著降低噪音）
+            if cfg.get("require_resonance", False) and not res_tfs:
+                log.info(f"[过滤] {tf} 无多周期共振(需≥{resonance_min}个同向) → 跳过推送")
+                continue
+
             title, content = format_signal_msg(tf, sig, last, cfg, resonance_tfs=res_tfs)
             send_alert(cfg, title, content)
             state[key] = last.name.isoformat()
@@ -1178,13 +1263,20 @@ def check_signals(cfg: dict, state: dict) -> dict:
             entry, sl, r_size, r1, r2, tp1, tp2 = calc_sl_tp(sig, last, cfg, tf)
             atr = last["atr"]
 
+            # 做单策略：仓位管理（与推送内容同源，避免两处算法漂移）
+            ps = calc_position_size(entry, sl, cfg) if cfg.get("use_position_sizing", True) else None
+            lot_tag = (
+                f" | 手数:{ps['lots']:.2f}(风险${ps['actual_risk']:.2f})"
+                if ps and ps.get("ok") else ""
+            )
+
             vol_status = "量✓" if last.get("vol_pass", True) else "量✗"
             trend_status = "多" if last["is_uptrend"] else "空" if last["is_downtrend"] else "震荡"
 
             signal_log.info(
                 f"{tf} {direction}{type_tag}{grade_tag}{band_tag}{res_tag} | "
                 f"入:{entry:.2f} | SL:{sl:.2f}(R{r_size:.2f}) | "
-                f"TP1:{tp1:.2f}({r1}R) TP2:{tp2:.2f}({r2}R) | "
+                f"TP1:{tp1:.2f}({r1}R) TP2:{tp2:.2f}({r2}R){lot_tag} | "
                 f"RSI:{last['rsi']:.1f} ATR:{atr:.2f} {vol_status} | "
                 f"趋势:{trend_status}"
             )
