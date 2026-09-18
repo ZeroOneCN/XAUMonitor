@@ -128,35 +128,49 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>XAUMonitor · DPB 黄金信号监控</title>
 <style>
-  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3; --mut:#8b949e;
-          --green:#3fb950; --red:#f85149; --gold:#d29922; --blue:#58a6ff; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e9eef5; --mut:#9aa7b6;
+          --green:#3fb950; --red:#f85149; --gold:#e3b341; --blue:#58a6ff; --fs:17px; }
+  * { box-sizing:border-box; -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-size:var(--fs); line-height:1.5;
          font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:1100px; margin:0 auto; padding:20px; }
-  h1 { font-size:20px; margin:0 0 4px; }
-  .sub { color:var(--mut); font-size:13px; margin-bottom:18px; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin-bottom:18px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px; }
-  .card .v { font-size:24px; font-weight:700; }
-  .card .l { color:var(--mut); font-size:12px; margin-top:4px; }
-  section { margin-bottom:22px; }
-  h2 { font-size:15px; margin:0 0 10px; color:var(--fg); border-left:3px solid var(--blue); padding-left:8px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { padding:7px 9px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
-  th { color:var(--mut); font-weight:600; font-size:12px; }
-  tr:hover td { background:#1c2230; }
-  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
-  .S { background:#d29922; color:#000; } .A { background:#3fb950; color:#000; }
-  .B { background:#58a6ff; color:#000; } .C { background:#8b949e; color:#000; }
-  .long { color:var(--green); font-weight:700; } .short { color:var(--red); font-weight:700; }
-  .tf-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
-  .tf { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; }
-  .tf .name { font-weight:700; font-size:14px; margin-bottom:8px; }
-  .tf .row { display:flex; justify-content:space-between; font-size:12px; color:var(--mut); margin:3px 0; }
-  .tf .row b { color:var(--fg); }
-  .fire { color:var(--gold); }
-  .muted { color:var(--mut); font-size:13px; }
+  .wrap { max-width:840px; margin:0 auto; padding:14px 12px 30px; }
+  h1 { font-size:22px; margin:0 0 2px; letter-spacing:.5px; }
+  h2 { font-size:18px; margin:0 0 10px; padding-left:9px; border-left:4px solid var(--blue); }
+  .sub { color:var(--mut); font-size:14px; margin-bottom:16px; }
+  section { margin-bottom:20px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:10px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .card .v { font-size:30px; font-weight:800; line-height:1.15; }
+  .card .l { color:var(--mut); font-size:14px; margin-top:2px; }
+  .tf-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px; }
+  .tf { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .tf .name { font-size:19px; font-weight:800; margin-bottom:8px; }
+  .tf .row { display:flex; justify-content:space-between; gap:10px; font-size:16px; color:var(--mut); padding:2px 0; }
+  .tf .row b { color:var(--fg); font-weight:700; }
+  .sig { background:var(--card); border:1px solid var(--border); border-radius:12px;
+         padding:13px 15px; margin-bottom:10px; }
+  .sig .top { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:10px; }
+  .sig .tfname { font-size:19px; font-weight:800; }
+  .sig .time { color:var(--mut); font-size:14px; margin-left:auto; }
+  .sig .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px 14px; }
+  .sig .kv { font-size:16px; color:var(--mut); display:flex; justify-content:space-between; gap:8px; }
+  .sig .kv b { color:var(--fg); font-weight:800; }
+  .dir-long { color:var(--green); font-weight:800; }
+  .dir-short { color:var(--red); font-weight:800; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:11px; font-size:14px; font-weight:800; }
+  .S{background:#e3b341;color:#000} .A{background:#3fb950;color:#000}
+  .B{background:#58a6ff;color:#000} .C{background:#8a94a6;color:#000}
+  .fire{color:var(--gold);font-weight:800}
+  .muted{color:var(--mut);font-size:15px}
+  .big{font-size:20px;font-weight:800}
+  @media (max-width:430px){
+    :root{ --fs:16px; }
+    .wrap{ padding:12px 10px 26px; }
+    .cards{ grid-template-columns:repeat(2,1fr); }
+    .card .v{ font-size:26px; }
+    .sig .grid{ grid-template-columns:1fr; }
+    h1{ font-size:20px; }
+  }
 </style>
 </head>
 <body>
@@ -241,31 +255,31 @@ async function load(){
     parts.forEach(p=>sd.appendChild(E('div',null,p)));
     sd.appendChild(E('div',null,'配置 — trade_freq='+sy.config.trade_freq+`  trend_stability=${sy.config.trend_stability}  min_grade=${sy.config.min_signal_grade}  共振阈值=${sy.config.resonance_min_count}  突破SL=${sy.config.breakout_sl_atr}×ATR`));
 
-    // 信号表
+    // 信号卡片列表（移动端友好，不横向滚动）
     const sw=document.getElementById('sigWrap'); sw.innerHTML='';
     if(!sg.signals.length){ sw.appendChild(E('div','muted','暂无信号记录')); return; }
-    const tb=E('table');
-    const hr=E('tr'); ['时间','周期','方向','类型','等级','评分','入场','止损','TP1','TP2','RSI','共振']
-      .forEach(h=>hr.appendChild(E('th',null,h))); tb.appendChild(hr);
+    const num = v => (v==null||v==='')?'-':(typeof v==='number'?v.toFixed(2):v);
     sg.signals.forEach(s=>{
-      const tr=E('tr');
-      const cells=[
-        [s.pushed_at||'', ''], [s.timeframe,''],
-        [s.direction===1?'多':'空', s.direction===1?'long':'short'],
-        [s.sig_type||'', ''], [s.grade||'', ''], [(s.score??'')+'/8', ''],
-        [s.entry?.toFixed?.(2)??s.entry,''], [s.sl?.toFixed?.(2)??s.sl,''],
-        [s.tp1?.toFixed?.(2)??s.tp1,''], [s.tp2?.toFixed?.(2)??s.tp2,''],
-        [s.rsi??'', ''], [s.resonance>=2?('🔥'+s.resonance):(s.resonance||''), s.resonance>=2?'fire':''],
-      ];
-      cells.forEach(([v,c])=>{
-        const td=E('td',c);
-        if(c==='' && /^[SABC]$/.test(v)){ const p=E('span','pill '+v,v); td.appendChild(p); }
-        else td.textContent=v;
-        tr.appendChild(td);
-      });
-      tb.appendChild(tr);
+      const box=E('div','sig');
+      const top=E('div','top');
+      top.appendChild(E('span','tfname', s.timeframe));
+      top.appendChild(E('span', s.direction===1?'dir-long':'dir-short', s.direction===1?'🟢 做多':'🔴 做空'));
+      if(s.sig_type) top.appendChild(E('span','muted', s.sig_type));
+      if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/8')));
+      if(s.resonance>=2) top.appendChild(E('span','fire','🔥共振'+s.resonance));
+      top.appendChild(E('span','time', s.pushed_at||''));
+      box.appendChild(top);
+      const g=E('div','grid');
+      const kv=(k,v,cls)=>{const d=E('div','kv');d.appendChild(E('span',null,k));d.appendChild(E('b',cls||null,v));g.appendChild(d);};
+      kv('入场', num(s.entry), 'big');
+      kv('止损', num(s.sl));
+      kv('TP1', num(s.tp1));
+      kv('TP2', num(s.tp2));
+      kv('RSI', s.rsi==null?'-':s.rsi);
+      kv('ATR', num(s.atr));
+      box.appendChild(g);
+      sw.appendChild(box);
     });
-    sw.appendChild(tb);
   }catch(e){
     document.getElementById('sub').textContent='加载失败: '+e;
   }
