@@ -32,6 +32,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import websockets
+import requests
 
 # ============================================================
 # 配置
@@ -47,6 +48,13 @@ TRADE_FLUSH_SECS = 5                         # 或最多等多少秒
 STAT_INTERVAL = 60                           # 统计日志间隔（秒）
 PING_INTERVAL = 20                           # 心跳（Binance 20 分钟发 ping，这里主动保活）
 PING_TIMEOUT = 60
+
+# 做单数据推送
+CONFIG_FILE = BASE / "dpb_config.json"       # 复用监控的配置(取 webhook)
+SIGNALS_DB = BASE / "signals.db"             # 复用监控的信号库
+LEVEL_RELOAD_SECS = 60                       # 重新加载监控价位的间隔
+LEVEL_MAX_SIGNALS = 20                       # 最多盯最近多少条信号
+DEFAULT_ALERT_MAX_AGE_H = 24                 # 信号超过多少小时不再盯
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,12 +117,132 @@ def log_event(db_path: Path, kind: str, detail: str):
 
 
 # ============================================================
+# 做单数据推送：实时盯住 signals.db 里信号的可执行价位
+# ============================================================
+def _load_cfg() -> dict:
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _webhooks(cfg: dict) -> list:
+    whs = list(cfg.get("wecom_webhooks") or [])
+    single = cfg.get("wecom_webhook")
+    if single and single not in whs:
+        whs.insert(0, single)
+    return [w for w in whs if w and "YOUR" not in w]
+
+
+def send_alert(title: str, content: str) -> bool:
+    """推送到所有已配置的告警通道（复用监控的多通道冗余逻辑）"""
+    whs = _webhooks(_load_cfg())
+    if not whs:
+        log.error("[做单] 未配置任何告警 webhook")
+        return False
+    ok = False
+    for wh in whs:
+        try:
+            payload = {"msgtype": "markdown", "markdown": {"content": f"## {title}\n{content}"}}
+            r = requests.post(wh, json=payload, timeout=10)
+            r.raise_for_status()
+            if r.json().get("errcode") == 0:
+                ok = True
+        except Exception as e:
+            log.error(f"[做单] 推送异常: {e}")
+    return ok
+
+
+class LevelWatcher:
+    """盘中实时监控「最近信号」的可执行价位（入场/止损/TP1/TP2）。
+
+    与 4 分钟轮询互补：轮询负责「发信号」，本模块负责「信号发出后，
+    价格盘中触及关键位时立刻提醒」，把 WS 的毫秒级精度变成做单价值。
+    """
+
+    def __init__(self, enabled: bool = True, max_age_h: float = DEFAULT_ALERT_MAX_AGE_H):
+        self.enabled = enabled
+        self.max_age_h = max_age_h
+        self.levels = []
+        self.fired = set()
+        self.prev = None
+        self.last_reload = 0.0
+
+    def _reload(self):
+        if not SIGNALS_DB.exists():
+            return
+        cutoff = (datetime.now() - timedelta(hours=self.max_age_h)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with sqlite3.connect(SIGNALS_DB) as conn:
+                rows = conn.execute(
+                    "SELECT id, timeframe, direction, sig_type, grade, score, entry, sl, tp1, tp2, pushed_at"
+                    " FROM signals WHERE pushed_at >= ? ORDER BY id DESC LIMIT ?",
+                    (cutoff, LEVEL_MAX_SIGNALS),
+                ).fetchall()
+        except Exception as e:
+            log.error(f"[做单价位] 读取 signals.db 失败: {e}")
+            return
+
+        lv = []
+        for (sid, tf, d, styp, grade, score, entry, sl, tp1, tp2, pushed_at) in rows:
+            label = f"{tf} {'做多' if d > 0 else '做空'}"
+            if styp:
+                label += f" [{styp}]"
+            if grade:
+                label += f" [{grade}级{score}/8]"
+            for kind, price in (("入场", entry), ("止损", sl), ("TP1", tp1), ("TP2", tp2)):
+                if price is None:
+                    continue
+                lv.append({
+                    "id": f"{sid}:{kind}", "kind": kind, "price": float(price),
+                    "label": label, "entry": float(entry), "sl": float(sl),
+                    "pushed_at": pushed_at,
+                })
+        self.levels = lv
+        log.info(f"[做单价位] {len(rows)} 条近期信号 → 监控 {len(lv)} 个价位")
+
+    def check(self, price: float):
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self.last_reload >= LEVEL_RELOAD_SECS:
+            self._reload()
+            self.last_reload = now
+        if self.prev is None:
+            self.prev = price
+            return
+        p0, p1 = self.prev, price
+        for l in self.levels:
+            if l["id"] in self.fired:
+                continue
+            p = l["price"]
+            if (p0 < p <= p1) or (p0 > p >= p1):   # 上穿或下穿
+                self.fired.add(l["id"])
+                self._alert(l, price)
+        self.prev = price
+
+    def _alert(self, l: dict, price: float):
+        emoji = {"入场": "🎯", "止损": "🛑", "TP1": "✅", "TP2": "🏆"}.get(l["kind"], "🔔")
+        title = f"{emoji} 盘中触发 {l['kind']} | {l['label']}"
+        content = (
+            f"> 触发价: **{l['price']:.2f}**\n"
+            f"> 现价(PAXG): **{price:.2f}**\n"
+            f"> 信号入场: {l['entry']:.2f} / 止损: {l['sl']:.2f}\n"
+            f"> 信号时间: {l['pushed_at']}"
+        )
+        log.info(f"[做单] 触发 {l['kind']} @ {l['price']:.2f} (现价 {price:.2f})")
+        send_alert(title, content)
+
+
+# ============================================================
 # 采集
 # ============================================================
 class Collector:
-    def __init__(self, db_path: Path, symbol: str):
+    def __init__(self, db_path: Path, symbol: str, watcher: "LevelWatcher" = None):
         self.db = db_path
         self.symbol = symbol
+        self.watcher = watcher or LevelWatcher(enabled=False)
         self.trade_buf = []
         self.last_flush = time.time()
         # 统计
@@ -193,6 +321,8 @@ class Collector:
             self.stat_lat_n += 1
             self.last_price = price
             self.flush()
+            # 做单数据：实时检查是否触及信号价位
+            self.watcher.check(price)
 
         elif stream.endswith("@kline_1m"):
             k = data.get("k", {})
@@ -258,12 +388,20 @@ def main():
     ap = argparse.ArgumentParser(description="Binance PAXG/USDT 旁路行情采集器")
     ap.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Binance 交易对(小写), 默认 paxgusdt")
     ap.add_argument("--db", default=str(DEFAULT_DB), help="SQLite 库路径")
+    ap.add_argument("--no-alert", action="store_true", help="关闭做单数据推送")
     args = ap.parse_args()
 
     db_path = Path(args.db)
     init_db(db_path)
 
-    c = Collector(db_path, args.symbol)
+    cfg = _load_cfg()
+    watcher = LevelWatcher(
+        enabled=(not args.no_alert) and bool(cfg.get("paxg_alert_enabled", True)),
+        max_age_h=float(cfg.get("paxg_alert_max_age_hours", DEFAULT_ALERT_MAX_AGE_H)),
+    )
+    log.info(f"[配置] 做单数据推送: {'开启' if watcher.enabled else '关闭'} | 价位有效期 {watcher.max_age_h}h")
+
+    c = Collector(db_path, args.symbol, watcher=watcher)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

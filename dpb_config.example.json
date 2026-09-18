@@ -62,5 +62,7 @@
   "min_signal_grade": "C",
   "resonance_min_count": 2,
   "db_file": "signals.db",
-  "wecom_webhooks": []
+  "wecom_webhooks": [],
+  "paxg_alert_enabled": true,
+  "paxg_alert_max_age_hours": 24
 }
