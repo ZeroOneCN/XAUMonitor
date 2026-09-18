@@ -1435,10 +1435,14 @@ def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars, cfg=
         adv = (entry - lo) / r_size if long else (hi - entry) / r_size
         mfe, mae = max(mfe, fav), max(mae, adv)
 
-        # 1) 先看止损（保守）
-        if (long and lo <= sl) or ((not long) and hi >= sl):
+        # 止损判定价：TP1 之后若把止损移到保本，实际出场价就是「入场价」，
+        # 不能还按原始止损价判——否则「TP1→回到入场(保本出场)→再冲TP2」这种情况
+        # 会被误判成还能拿到 TP2，高估收益。
+        eff_sl = entry if (tp1_hit and be) else sl
+        # 1) 先看止损/保本出场（保守）
+        if (long and lo <= eff_sl) or ((not long) and hi >= eff_sl):
             if tp1_hit:
-                # TP1 之后才回撤：剩余仓位按「止损已移到保本」计 0R
+                # TP1 已平一半；剩余一半在保本(0R) 或 原止损(-1R) 出场
                 return {"outcome": "TP1", "r": blend(0.0 if be else -1.0),
                         "bars": n, "mfe": mfe, "mae": mae, "done": True}
             return {"outcome": "SL", "r": -1.0, "bars": n,
