@@ -15,7 +15,7 @@ import time
 import logging
 import argparse
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -101,6 +101,11 @@ def load_config():
         "min_lot": 0.01,               # 最小可下单手数
         "max_lot": 10.0,               # 手数安全上限（防手滑重仓）
         "require_resonance": False,    # 是否只推送「多周期共振」的信号
+        # 止损距离约束（修复「止损跑到入场价另一侧」的致命 bug）
+        "min_sl_atr": 0.3,             # 止损最近：至少 0.3×ATR
+        "max_sl_atr": 4.0,             # 止损最远：最多 4×ATR（限制单笔敞口）
+        "fallback_sl_atr": 1.5,        # 结构失效（止损落到入场价另一侧）时的兜底倍数
+        "outcome_max_age_days": 30,    # 结果追踪回看天数
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(default, f, indent=2, ensure_ascii=False)
@@ -992,17 +997,43 @@ def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
     pullback_extreme = row.get("signal_pullback_extreme", np.nan)
     sig_type = row.get("signal_type", "")
     bo_sl_atr = cfg.get("breakout_sl_atr", 1.5)
+    min_sl_atr = cfg.get("min_sl_atr", 0.3)   # 止损最近距离（ATR倍数）
+    max_sl_atr = cfg.get("max_sl_atr", 4.0)   # 止损最远距离，限制单笔敞口
+    fallback_sl_atr = cfg.get("fallback_sl_atr", 1.5)  # 结构失效时的兜底止损
 
     if sig_type == "突破":
         # 突破模式：价格已远离 EMA70(≥2×ATR)，用 ema70 做止损过宽 → 改用固定 ATR 倍数
         sl = entry - atr * bo_sl_atr if sig > 0 else entry + atr * bo_sl_atr
-        r_size = max(abs(entry - sl), atr * 0.1)
     elif sig > 0:
-        sl = max(ema70, pullback_extreme - atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
-        r_size = max(abs(entry - sl), atr * 0.1)
+        cand = [ema70]
+        if not np.isnan(pullback_extreme):
+            cand.append(pullback_extreme - atr * sl_cushion)
+        sl = max(cand)
     else:
-        sl = min(ema70, pullback_extreme + atr * sl_cushion) if not np.isnan(pullback_extreme) else ema70
-        r_size = max(abs(sl - entry), atr * 0.1)
+        cand = [ema70]
+        if not np.isnan(pullback_extreme):
+            cand.append(pullback_extreme + atr * sl_cushion)
+        sl = min(cand)
+
+    # ---- 修正（由结果追踪暴露）----
+    # 原逻辑下「回踩做多」可能算出 sl > entry（止损跑到入场价上方），
+    # 后果是下一根K线必然判定"已止损"，信号从诞生就注定亏损。
+    # 结构失效时退回 1.5×ATR 的稳健止损（而非夹到 0.3×ATR 被噪音扫掉）。
+    if sig > 0 and not (sl < entry):
+        sl = entry - atr * fallback_sl_atr
+    if sig < 0 and not (sl > entry):
+        sl = entry + atr * fallback_sl_atr
+
+    # 统一夹紧止损距离到 [min_sl_atr, max_sl_atr]×ATR
+    if atr and not np.isnan(atr) and atr > 0:
+        if sig > 0:
+            sl = min(sl, entry - atr * min_sl_atr)   # 不能贴太近，更不能在上方
+            sl = max(sl, entry - atr * max_sl_atr)   # 不能太远
+        else:
+            sl = max(sl, entry + atr * min_sl_atr)
+            sl = min(sl, entry + atr * max_sl_atr)
+
+    r_size = max(abs(entry - sl), (atr * 0.1) if (atr and not np.isnan(atr)) else 0.01)
 
     tf_min_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
     tf_min = tf_min_map.get(tf, 60)
@@ -1133,6 +1164,20 @@ def init_db(db_file: str):
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_tf_ts ON signals(timeframe, ts)")
+            # 结果追踪表（做单策略复盘：记录每笔信号最终先碰 SL 还是 TP）
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_outcomes (
+                    signal_id INTEGER PRIMARY KEY,
+                    timeframe TEXT, direction INTEGER,
+                    outcome TEXT,        -- SL / TP1 / TP2 / open / timeout
+                    r_multiple REAL,     -- 最终R倍数(-1=止损, +r1=TP1, +r2=TP2)
+                    bars INTEGER,        -- 多少根K线出结果
+                    mfe REAL,            -- 最大有利偏移(R)
+                    mae REAL,            -- 最大不利偏移(R)
+                    resolved_at TEXT,
+                    updated_at TEXT
+                )
+            """)
             conn.commit()
     except Exception as e:
         log.error(f"[DB] 建表失败: {e}")
@@ -1164,6 +1209,186 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_
             conn.commit()
     except Exception as e:
         log.error(f"[DB] 信号写入失败: {e}")
+
+
+# ============================================================
+# 结果追踪：验证闭环的地基
+# ============================================================
+def _r_of(price: float, entry: float, r_size: float, direction: int) -> float:
+    """把价格折算成 R 倍数（+1R = 赚一个止损距离）"""
+    return (price - entry) * direction / r_size if r_size else 0.0
+
+
+def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars):
+    """在信号之后的 K 线里逐根扫描，判断先碰止损还是止盈。
+
+    保守原则：同一根 K 线内同时触及 SL 与 TP 时，按「先止损」处理
+    （避免高估胜率——回测里最常见的自欺来源）。
+    """
+    long = direction > 0
+    try:
+        ts_dt = pd.Timestamp(ts)
+    except Exception:
+        return None
+    if getattr(df.index, "tz", None) is not None and ts_dt.tzinfo is None:
+        ts_dt = ts_dt.tz_localize(df.index.tz)
+
+    idx = int(df.index.searchsorted(ts_dt))
+    if idx >= len(df):
+        return None          # 信号太新，数据里还没有它之后的 K 线
+    bars = df.iloc[idx + 1: idx + 1 + max_bars]
+    if bars.empty:
+        return {"outcome": "open", "r": 0.0, "bars": 0, "mfe": 0.0, "mae": 0.0}
+
+    tp1_hit = False
+    mfe = mae = 0.0
+    for n, (_, b) in enumerate(bars.iterrows(), start=1):
+        hi, lo = float(b["High"]), float(b["Low"])
+        # 有利/不利偏移（统一用方向折算，long/short 都取正）
+        fav = (hi - entry) / r_size if long else (entry - lo) / r_size
+        adv = (entry - lo) / r_size if long else (hi - entry) / r_size
+        mfe, mae = max(mfe, fav), max(mae, adv)
+
+        # 1) 先看止损（保守）
+        if (long and lo <= sl) or ((not long) and hi >= sl):
+            if tp1_hit:
+                return {"outcome": "TP1", "r": _r_of(tp1, entry, r_size, direction),
+                        "bars": n, "mfe": mfe, "mae": mae}
+            return {"outcome": "SL", "r": -1.0, "bars": n, "mfe": mfe, "mae": mae}
+        # 2) TP2
+        if (long and hi >= tp2) or ((not long) and lo <= tp2):
+            return {"outcome": "TP2", "r": _r_of(tp2, entry, r_size, direction),
+                    "bars": n, "mfe": mfe, "mae": mae}
+        # 3) TP1（先记达标，继续扫描看能否到 TP2）
+        if (long and hi >= tp1) or ((not long) and lo <= tp1):
+            tp1_hit = True
+
+    if tp1_hit:
+        return {"outcome": "TP1", "r": _r_of(tp1, entry, r_size, direction),
+                "bars": len(bars), "mfe": mfe, "mae": mae}
+    return {"outcome": "open", "r": 0.0, "bars": len(bars), "mfe": mfe, "mae": mae}
+
+
+def evaluate_outcomes(cfg: dict, max_bars: int = 300) -> dict:
+    """追踪已推送信号的实际结果（先碰 SL 还是 TP、最终 R 倍数）。
+
+    没有这一层，任何参数调整都是盲猜——这是「验证闭环」的地基。
+    按周期分组取数，同一周期只抓一次，节省 API 配额。
+    """
+    db_file = cfg.get("db_file", "signals.db")
+    max_age_days = int(cfg.get("outcome_max_age_days", 30))
+    cutoff = (datetime.now() - timedelta(days=max_age_days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with sqlite3.connect(_db_path(db_file)) as conn:
+            rows = conn.execute(
+                "SELECT s.id, s.timeframe, s.direction, s.entry, s.sl, s.tp1, s.tp2, s.r_size, s.ts"
+                " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+                " WHERE (o.signal_id IS NULL OR o.outcome = 'open') AND s.pushed_at >= ?"
+                " ORDER BY s.id", (cutoff,)
+            ).fetchall()
+    except Exception as e:
+        log.error(f"[追踪] 读取待追踪信号失败: {e}")
+        return {}
+
+    if not rows:
+        return {}
+
+    by_tf = {}
+    for r in rows:
+        by_tf.setdefault(r[1], []).append(r)
+
+    stats = {"open": 0, "SL": 0, "TP1": 0, "TP2": 0}
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for tf, sigs in by_tf.items():
+        params = (cfg.get("timeframes") or {}).get(tf)
+        if not params:
+            continue
+        try:
+            ticker = cfg.get("ticker_td", cfg.get("ticker_av", cfg["ticker"]))
+            df = fetch_data(ticker, tf, params["interval"])
+        except Exception as e:
+            log.error(f"[追踪] {tf} 取数失败: {e}")
+            continue
+
+        for (sid, _tf, direction, entry, sl, tp1, tp2, r_size, ts) in sigs:
+            try:
+                res = _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars)
+            except Exception as e:
+                log.error(f"[追踪] 信号#{sid} 评估失败: {e}")
+                continue
+            if not res:
+                continue
+            stats[res["outcome"]] = stats.get(res["outcome"], 0) + 1
+            resolved = None if res["outcome"] == "open" else now_s
+            try:
+                with sqlite3.connect(_db_path(db_file)) as conn:
+                    conn.execute(
+                        "INSERT INTO signal_outcomes (signal_id, timeframe, direction, outcome,"
+                        " r_multiple, bars, mfe, mae, resolved_at, updated_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(signal_id) DO UPDATE SET outcome=excluded.outcome,"
+                        " r_multiple=excluded.r_multiple, bars=excluded.bars, mfe=excluded.mfe,"
+                        " mae=excluded.mae, resolved_at=excluded.resolved_at,"
+                        " updated_at=excluded.updated_at",
+                        (sid, tf, direction, res["outcome"], res["r"], res["bars"],
+                         res["mfe"], res["mae"], resolved, now_s),
+                    )
+                    conn.commit()
+            except Exception as e:
+                log.error(f"[追踪] 信号#{sid} 写库失败: {e}")
+
+    log.info(
+        f"[追踪] 本轮评估 {len(rows)} 笔 → 止损{stats.get('SL', 0)} "
+        f"TP1:{stats.get('TP1', 0)} TP2:{stats.get('TP2', 0)} 追踪中:{stats.get('open', 0)}"
+    )
+    return stats
+
+
+def outcome_stats(db_file: str) -> dict:
+    """汇总已结案信号的胜率与期望值（供仪表盘/日志复盘）"""
+    try:
+        with sqlite3.connect(_db_path(db_file)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT o.outcome, o.r_multiple, o.bars, s.grade, s.sig_type, s.timeframe"
+                " FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id"
+                " WHERE o.outcome IN ('SL','TP1','TP2')"
+            ).fetchall()
+    except Exception as e:
+        log.error(f"[统计] 读取失败: {e}")
+        return {"closed": 0}
+
+    if not rows:
+        return {"closed": 0}
+
+    rs = [float(r["r_multiple"] or 0) for r in rows]
+    wins = [x for x in rs if x > 0]
+    losses = [x for x in rs if x <= 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    by_grade = {}
+    for r in rows:
+        g = r["grade"] or "?"
+        d = by_grade.setdefault(g, {"n": 0, "wins": 0, "r": 0.0})
+        d["n"] += 1
+        d["r"] += float(r["r_multiple"] or 0)
+        if float(r["r_multiple"] or 0) > 0:
+            d["wins"] += 1
+
+    return {
+        "closed": len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(rows) * 100,
+        "expectancy_r": sum(rs) / len(rows),
+        "total_r": sum(rs),
+        "avg_win_r": (gross_win / len(wins)) if wins else 0.0,
+        "avg_loss_r": (-gross_loss / len(losses)) if losses else 0.0,
+        "profit_factor": (gross_win / gross_loss) if gross_loss else float("inf"),
+        "by_grade": by_grade,
+    }
 
 
 # ============================================================
@@ -1334,6 +1559,15 @@ def main():
             try:
                 state = check_signals(cfg, state)
                 save_state(cfg["state_file"], state)
+                # 结果追踪：评估已推送信号的实际结果（验证闭环的地基）
+                evaluate_outcomes(cfg)
+                st = outcome_stats(cfg.get("db_file", "signals.db"))
+                if st.get("closed"):
+                    log.info(
+                        f"[胜率] 已结案{st['closed']}笔 | 胜率{st['win_rate']:.1f}% | "
+                        f"期望{st['expectancy_r']:+.2f}R | 盈亏因子{st['profit_factor']:.2f} | "
+                        f"累计{st['total_r']:+.2f}R"
+                    )
             except Exception as e:
                 log.error(f"[错误] 循环检查异常: {e}")
             log.info(f"[等待] {interval//60} 分钟后下次检查...")
@@ -1342,6 +1576,13 @@ def main():
         log.info("[启动] 单次检查模式")
         state = check_signals(cfg, state)
         save_state(cfg["state_file"], state)
+        evaluate_outcomes(cfg)
+        st = outcome_stats(cfg.get("db_file", "signals.db"))
+        if st.get("closed"):
+            log.info(
+                f"[胜率] 已结案{st['closed']}笔 | 胜率{st['win_rate']:.1f}% | "
+                f"期望{st['expectancy_r']:+.2f}R | 盈亏因子{st['profit_factor']:.2f}"
+            )
         log.info("[完成] 检查结束")
 
 

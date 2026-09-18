@@ -72,5 +72,9 @@
   "min_lot": 0.01,
   "max_lot": 10.0,
   "require_resonance": false,
-  "leverage": 1000
+  "leverage": 1000,
+  "min_sl_atr": 0.3,
+  "max_sl_atr": 4.0,
+  "fallback_sl_atr": 1.5,
+  "outcome_max_age_days": 30
 }

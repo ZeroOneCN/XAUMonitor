@@ -96,6 +96,55 @@ def api_signals(limit: int = 60):
     return {"count": len(rows), "signals": rows}
 
 
+@app.get("/api/outcomes")
+def api_outcomes():
+    """结果追踪统计：胜率 / 期望值 / 盈亏因子（做单策略的验证闭环）"""
+    rows = _query(
+        "SELECT o.outcome, o.r_multiple, o.bars, o.mfe, o.mae,"
+        " s.grade, s.sig_type, s.timeframe, s.direction, s.id"
+        " FROM signal_outcomes o JOIN signals s ON s.id = o.signal_id"
+        " ORDER BY s.id"
+    )
+    closed = [r for r in rows if r["outcome"] in ("SL", "TP1", "TP2")]
+    open_n = len(rows) - len(closed)
+    if not closed:
+        return {"closed": 0, "open": open_n, "win_rate": None, "expectancy_r": None,
+                "profit_factor": None, "total_r": 0.0, "wins": 0, "losses": 0,
+                "by_grade": {}, "by_type": {}, "by_timeframe": {}, "recent": []}
+
+    rs = [float(r["r_multiple"] or 0) for r in closed]
+    wins = [x for x in rs if x > 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(x for x in rs if x <= 0))
+
+    def _agg(key):
+        d = {}
+        for r in closed:
+            k = r[key] or "?"
+            v = d.setdefault(str(k), {"n": 0, "wins": 0, "r": 0.0})
+            v["n"] += 1
+            v["r"] += float(r["r_multiple"] or 0)
+            if float(r["r_multiple"] or 0) > 0:
+                v["wins"] += 1
+        return d
+
+    recent = [dict(r) for r in closed][-20:][::-1]
+    return {
+        "closed": len(closed),
+        "open": open_n,
+        "wins": len(wins),
+        "losses": len(closed) - len(wins),
+        "win_rate": len(wins) / len(closed) * 100,
+        "expectancy_r": sum(rs) / len(closed),
+        "total_r": sum(rs),
+        "profit_factor": (gross_win / gross_loss) if gross_loss else None,
+        "by_grade": _agg("grade"),
+        "by_type": _agg("sig_type"),
+        "by_timeframe": _agg("timeframe"),
+        "recent": recent,
+    }
+
+
 @app.get("/api/status")
 def api_status():
     cfg = _cfg()
@@ -191,6 +240,12 @@ HTML_PAGE = """<!DOCTYPE html>
   </section>
 
   <section>
+    <h2>结果追踪 · 胜率</h2>
+    <div class="cards" id="outCards"></div>
+    <div id="outDetail" class="muted" style="margin-top:12px"></div>
+  </section>
+
+  <section>
     <h2>最近信号</h2>
     <div id="sigWrap" class="muted">加载中…</div>
   </section>
@@ -206,10 +261,11 @@ const fmtN = v => (v==null?'-':v);
 
 async function load(){
   try{
-    const [st, sg, sy] = await Promise.all([
+    const [st, sg, sy, oc] = await Promise.all([
       fetch('/api/stats').then(r=>r.json()),
       fetch('/api/signals?limit=60').then(r=>r.json()),
       fetch('/api/status').then(r=>r.json()),
+      fetch('/api/outcomes').then(r=>r.json()).catch(()=>({closed:0})),
     ]);
 
     // 顶栏
@@ -244,6 +300,27 @@ async function load(){
       add('K线时间', d.bar_time);
       tg.appendChild(box);
     });
+
+    // 结果追踪（胜率 / 期望值）
+    const ow = document.getElementById('outCards'); ow.innerHTML='';
+    const od = document.getElementById('outDetail'); od.textContent='';
+    if(!oc.closed){
+      od.textContent = `暂无已结案信号（追踪中 ${oc.open||0} 笔）— 需价格先触及 SL 或 TP 才会有结果`;
+    } else {
+      const cards2 = [
+        ['胜率', oc.win_rate.toFixed(1)+'%', ''],
+        ['期望值', (oc.expectancy_r>=0?'+':'')+oc.expectancy_r.toFixed(2)+'R', ''],
+        ['累计R', (oc.total_r>=0?'+':'')+oc.total_r.toFixed(2)+'R', ''],
+        ['盈亏因子', oc.profit_factor==null?'∞':oc.profit_factor.toFixed(2), ''],
+        ['已结案', oc.closed, ''],
+        ['追踪中', oc.open||0, ''],
+      ];
+      cards2.forEach(([l,v])=>{const c=E('div','card');c.appendChild(E('div','v',v));c.appendChild(E('div','l',l));ow.appendChild(c);});
+      const agg=(obj,label)=>{const ks=Object.keys(obj||{});if(!ks.length)return '';
+        return ` · ${label}: `+ks.map(k=>`${k} ${obj[k].wins}/${obj[k].n}(${obj[k].r>=0?'+':''}${obj[k].r.toFixed(1)}R)`).join('  ');};
+      od.textContent = `胜 ${oc.wins} / 负 ${oc.losses}`
+        + agg(oc.by_grade,'按等级') + agg(oc.by_type,'按类型') + agg(oc.by_timeframe,'按周期');
+    }
 
     // 统计
     const parts=[];
