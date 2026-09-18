@@ -1342,6 +1342,24 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_
         log.error(f"[DB] 信号写入失败: {e}")
 
 
+def _already_pushed(db_file: str, tf: str, bar_iso: str, direction: int) -> bool:
+    """DB 级去重：同一「周期 + K线 + 方向」是否已推送过。
+
+    第二道防线——去重状态文件丢失/损坏、或异常重启导致内存状态丢失时，
+    防止同一根K线的信号被重复推送（会把用户刷屏）。
+    """
+    try:
+        with sqlite3.connect(_db_path(db_file)) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM signals WHERE timeframe=? AND ts=? AND direction=? LIMIT 1",
+                (tf, bar_iso, int(direction)),
+            ).fetchone()
+            return bool(row)
+    except Exception as e:
+        log.error(f"[DB] 去重检查失败: {e}")
+        return False
+
+
 # ============================================================
 # 结果追踪：验证闭环的地基
 # ============================================================
@@ -1654,6 +1672,12 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
             key = f"{tf}_{sig}"
             if state.get(key) == last.name.isoformat():
                 log.info(f"[信号] {tf} 已有推送，跳过")
+                continue
+
+            # DB 级去重（第二道防线）：状态文件丢失/损坏时也能挡住重复推送
+            if _already_pushed(cfg.get("db_file", "signals.db"), tf, last.name.isoformat(), sig):
+                state[key] = last.name.isoformat()
+                log.info(f"[信号] {tf} 同K线已在库中(DB去重) → 跳过推送")
                 continue
 
             # 共振判定：同向周期数 >= 阈值

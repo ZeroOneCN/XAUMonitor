@@ -184,18 +184,24 @@ class LevelWatcher:
             log.error(f"[做单价位] 读取 signals.db 失败: {e}")
             return
 
-        lv = []
+        lv, seen = [], set()
         for (sid, tf, d, styp, grade, score, entry, sl, tp1, tp2, pushed_at) in rows:
             label = f"{tf} {'做多' if d > 0 else '做空'}"
             if styp:
                 label += f" [{styp}]"
             if grade:
-                label += f" [{grade}级{score}/8]"
+                label += f" [{grade}级{score}分]"
             for kind, price in (("入场", entry), ("止损", sl), ("TP1", tp1), ("TP2", tp2)):
                 if price is None:
                     continue
+                # 同一「类型+价位」只盯一次：哪怕信号表里因重复推送留下多行，
+                # 也不会对同一个价位反复触发告警（防刷屏的第二道防线）
+                key = (kind, round(float(price), 2))
+                if key in seen:
+                    continue
+                seen.add(key)
                 lv.append({
-                    "id": f"{sid}:{kind}", "kind": kind, "price": float(price),
+                    "id": f"{kind}:{float(price):.2f}", "kind": kind, "price": float(price),
                     "label": label, "entry": float(entry), "sl": float(sl),
                     "pushed_at": pushed_at,
                 })
