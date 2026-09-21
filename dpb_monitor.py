@@ -282,8 +282,53 @@ def _available_keys(cfg: dict) -> list:
     return fresh or [k for k in keys if k and k != "YOUR_API_KEY_HERE"]
 
 
-def fetch_data(ticker: str, period: str, interval: str, retries: int = 3) -> pd.DataFrame:
-    """用 Twelve Data 获取K线数据：多key轮询 + 节流 + 重试"""
+# Twelve Data 的 interval 字符串 → 一根K线多少分钟
+# 【注意】不要叫 _TF_MINUTES —— 本文件后文已有一个同名常量（键是 "5m"/"15m" 这类
+# 周期名），定义在后面会静默覆盖它，导致本函数查不到值、修复悄悄失效。
+_INTERVAL_MINUTES = {"1min": 1, "5min": 5, "15min": 15, "30min": 30,
+                     "1h": 60, "4h": 240, "1day": 1440, "1d": 1440}
+
+
+def drop_partial_bar(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """丢弃尚未收盘的最后一根K线。
+
+    【为什么必须丢 —— 这是实盘与回测背离的根源，也是"信号总是相反的"的成因】
+
+    Twelve Data 会把「正在形成中」的K线一并返回，它的 High/Low/Close 每秒都在变。
+    直接拿它算信号会产生两类严重后果：
+
+    1) 盘中假信号：价格瞬间冲高就触发「突破」，等K线真正收盘时形态已消失。
+       实测 24 条实盘信号中有 9 条属于此类（突破占多数，收盘后成立率仅 46%）。
+       这 9 条的期望是 **-0.757R**，而收盘后仍成立的 15 条只有 -0.097R
+       —— 它们吃掉了总亏损 -8.27R 中的 **-6.81R（82%）**。
+
+    2) 用户体感「信号都是相反的」：入场价取的是K线冲高那一刻的现价（接近该K线最高点），
+       买在尖顶上，随后价格回落到止损，看起来就像"专挑反方向"。
+
+    回测走的是已收盘的历史K线，所以不丢这根必然导致「实盘 ≠ 回测」。
+    """
+    mins = _INTERVAL_MINUTES.get(interval)
+    if not mins or len(df) < 2:
+        return df
+    try:
+        last_start = pd.Timestamp(df.index[-1])
+        close_at = last_start + pd.Timedelta(minutes=mins)
+        # 30 秒宽限：避免刚好卡在收盘瞬间误丢一根好K线
+        if pd.Timestamp.now() < close_at - pd.Timedelta(seconds=30):
+            return df.iloc[:-1]
+    except Exception:
+        return df
+    return df
+
+
+def fetch_data(ticker: str, period: str, interval: str, retries: int = 3,
+               drop_partial: bool = True) -> pd.DataFrame:
+    """用 Twelve Data 获取K线数据：多key轮询 + 节流 + 重试
+
+    drop_partial=True（默认）会丢弃尚未收盘的最后一根K线 —— 见 drop_partial_bar()。
+    算信号必须用 True（否则会产生盘中假信号）；
+    仅在需要"看一眼当前正在形成的K线"时才传 False。
+    """
     cfg = load_config()
     keys = _available_keys(cfg)
     if not keys:
@@ -368,6 +413,14 @@ def fetch_data(ticker: str, period: str, interval: str, retries: int = 3) -> pd.
             if df.empty:
                 raise ValueError(f"未获取到数据: {ticker} {interval}")
             
+            # 【关键】丢弃尚未收盘的最后一根K线 —— 否则会用「正在形成中」的
+            # 形态算信号，产生盘中假信号（详见 drop_partial_bar 说明）
+            if drop_partial:
+                _n0 = len(df)
+                df = drop_partial_bar(df, interval)
+                if len(df) < _n0:
+                    log.info(f"[数据] 丢弃未收盘K线（原末根 {df.index[-1]} 之后多出 "
+                             f"{_n0 - len(df)} 根）")
             log.info(f"[数据] 获取 {len(df)} 根K线 (key {key[:6]}...), 范围 {df.index[0]} ~ {df.index[-1]}")
             _track_request(key)  # 计一次成功请求
             return df
