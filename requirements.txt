@@ -1,6 +1,18 @@
-pandas>=2.0.0
-numpy>=1.24.0
-requests>=2.31.0
-fastapi>=0.110.0
-uvicorn>=0.27.0
-websockets>=12.0
+# XAUMonitor 依赖 —— 精确锁定版本
+#
+# 为什么锁死而不是用 >= 下限：
+# 2026-09 实际装到的是 pandas 3.0.5 / numpy 2.5.3，而 requirements 里只写了
+# pandas>=2.0.0 —— 从 2.x 跨到 3.x 是 major 跳跃，pandas 3 对链式赋值、
+# copy-on-write、时间索引 tz 处理都改过行为。本系统大量依赖 DataFrame 的
+# High/Low/Close 运算与 DatetimeIndex 对齐，一次静默的行为变化就足以让信号
+# 计算或回测结论整体偏掉，而且**不会报错**。
+#
+# 这些版本是当前生产环境实测跑通的全套组合（等价于 lock 文件）。
+# 升级时请成组升级，并跑 test_outcomes.py + test_risk_gate.py + 回测复现验证。
+pandas==3.0.5
+numpy==2.5.3
+requests==2.34.2
+fastapi==0.141.1
+uvicorn==0.53.0
+websockets==17.1
+pydantic==2.13.5

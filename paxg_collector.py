@@ -57,6 +57,13 @@ SIGNALS_DB = BASE / "signals.db"             # 复用监控的信号库
 FIRED_FILE = BASE / "paxg_fired.json"        # 已触发价位记录（持久化，避免重启后重发）
 LEVEL_RELOAD_SECS = 60                       # 重新加载监控价位的间隔
 MAINTAIN_SECS = 86400                        # 数据库归档自维护间隔（每日一次）
+WAL_TRUNCATE_SECS = 3600                     # WAL 收缩间隔（每小时）
+
+# 为什么需要单独做 WAL 收缩：
+# SQLite 的 wal_autocheckpoint 是 PASSIVE 模式 —— 它把已提交页写回主库，
+# 但**从不收缩 WAL 文件本身**。采集器每秒写成交，WAL 会一路涨到历史最高水位
+# 并停在那里（实测涨到 10.4MB，与主库同大），既占磁盘又拖慢崩溃恢复。
+# PASSIVE 之外只有 TRUNCATE/RESTART 会把文件截回 0，必须显式、周期性执行。
 # PAXG↔XAU 价差修正（见 _paxg_basis 说明：两个市场的价格不能直接比）
 BASIS_TTL_SEC = 600                          # 价差基准缓存 10 分钟（价差移动很慢，省额度）
 _basis_cache = {"t": 0.0, "key": "", "val": None}
@@ -259,6 +266,26 @@ def _next_month(y: int, m: int) -> datetime:
     return datetime(y + (1 if m == 12 else 0), 1 if m == 12 else m + 1, 1)
 
 
+def wal_truncate(db_path=None) -> bool:
+    """把 WAL 文件截回 0（PASSIVE 之外的唯一办法）。
+
+    注意：TRUNCATE 需要拿到写锁；若此刻主连接正在写入会返回 busy，
+    此时**不能重试**（采集器每秒都在写），下一轮再来即可 —— 所以失败只记
+    调试日志，绝不影响采集。返回 True 表示真正收缩了。
+    """
+    db = Path(db_path) if db_path else DEFAULT_DB
+    try:
+        with sqlite3.connect(str(db), timeout=5) as conn:
+            busy, log_pages, ckpt = conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if busy:
+            return False
+        return True
+    except Exception as e:
+        log.debug(f"[WAL] 收缩跳过: {e}")
+        return False
+
+
 def maintain_db(cfg: dict, db_path=None, dry_run: bool = False) -> dict:
     """归档 + 清理 paxg_stream.db，返回统计信息。"""
     db = Path(db_path or cfg.get("paxg_db_file", DEFAULT_DB))
@@ -380,6 +407,7 @@ class LevelWatcher:
         self.enabled = enabled
         self.db_path = Path(db_path) if db_path else DEFAULT_DB
         self.last_maintain = 0.0        # 0 → 启动后第一轮就做一次自维护，之后每日一次
+        self.last_wal_ckpt = 0.0        # WAL 收缩计时
         self.max_age_h = max_age_h
         # 价差修正取不到时的告警只报一次，避免刷屏
         self._basis_warned = False
@@ -492,6 +520,10 @@ class LevelWatcher:
                 maintain_db(_load_cfg(), self.db_path)
             except Exception as e:
                 log.error(f"[归档] 自维护失败: {e}")
+        # 每小时收缩一次 WAL，防止它涨到历史最高水位后不再回落
+        if now - self.last_wal_ckpt >= WAL_TRUNCATE_SECS:
+            self.last_wal_ckpt = now
+            wal_truncate(self.db_path)
         if self.prev is None:
             self.prev = price
             return

@@ -1414,7 +1414,10 @@ def paxg_volume_ratio(cfg: dict, tf: str, n_bars: int = 20):
             rows = conn.execute(
                 "SELECT open_ms, volume, quote_volume, trades FROM klines_1m"
                 " WHERE closed = 1 ORDER BY open_ms DESC LIMIT ?", (need,)).fetchall()
-    except Exception:
+    except Exception as e:
+        # 量能只是展示项、不参与打分，失败不该中断信号流程；
+        # 但要留痕：若长期失败说明 PAXG 库路径/结构变了，卡片会一直缺这块。
+        log.debug(f"[量能] 读 PAXG 库失败，本轮不显示真实量能: {e}")
         return None
     if len(rows) < tf_min * 2:
         return None
@@ -1510,8 +1513,12 @@ def init_db(db_file: str):
             # 迁移：老库补 cost_r 列（幂等）
             try:
                 conn.execute("ALTER TABLE signal_outcomes ADD COLUMN cost_r REAL DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                # 唯一预期内的失败是「列已存在」（duplicate column name）。
+                # 其他 OperationalError 说明迁移真的没生效 —— 不能一律吞掉，
+                # 否则后面的统计会一直缺 cost_r 却毫无提示。
+                if "duplicate column" not in str(e).lower():
+                    log.error(f"[DB] cost_r 列迁移失败（点差成本将缺失）: {e}")
             conn.commit()
     except Exception as e:
         log.error(f"[DB] 建表失败: {e}")
@@ -1545,18 +1552,30 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_
         log.error(f"[DB] 信号写入失败: {e}")
 
 
-def _already_pushed(db_file: str, tf: str, bar_iso: str, direction: int) -> bool:
-    """DB 级去重：同一「周期 + K线 + 方向」是否已推送过。
+def _already_pushed(db_file: str, tf: str, bar_iso: str, direction: int,
+                    sig_type: str = None) -> bool:
+    """DB 级去重：同一「周期 + K线 + 方向 + 信号类型」是否已推送过。
 
     第二道防线——去重状态文件丢失/损坏、或异常重启导致内存状态丢失时，
     防止同一根K线的信号被重复推送（会把用户刷屏）。
+
+    sig_type 为什么要进来：DPB 的信号分「回踩」「突破」两类。旧版 key 只有
+    周期+方向，导致同一根K线上「先出回踩、后出突破」（同方向）时，第二种
+    会被误判为重复而跳过 —— 丢掉一个真实信号。传 None 时保持旧行为（兼容）。
     """
     try:
         with sqlite3.connect(_db_path(db_file)) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM signals WHERE timeframe=? AND ts=? AND direction=? LIMIT 1",
-                (tf, bar_iso, int(direction)),
-            ).fetchone()
+            if sig_type:
+                row = conn.execute(
+                    "SELECT 1 FROM signals WHERE timeframe=? AND ts=? AND direction=?"
+                    " AND IFNULL(sig_type,'')=? LIMIT 1",
+                    (tf, bar_iso, int(direction), sig_type),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT 1 FROM signals WHERE timeframe=? AND ts=? AND direction=? LIMIT 1",
+                    (tf, bar_iso, int(direction)),
+                ).fetchone()
             return bool(row)
     except Exception as e:
         log.error(f"[DB] 去重检查失败: {e}")
@@ -1658,6 +1677,19 @@ def _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts, max_bars, cfg=
         # 窗口真正走满才算结案，否则继续追踪（可能还要到 TP2）
         return {"outcome": "TP1", "r": blend(0.0), "bars": len(bars),
                 "mfe": mfe, "mae": mae, "done": len(bars) >= max_bars}
+    # 窗口走满、却始终没碰到 SL 也没碰到 TP1 → 超时结案（EXP），
+    # 按窗口最后一根收盘价计 R（等于「持有到期限后市价平掉」）。
+    #
+    # 旧版这里返回 done=False —— 后果有两个，都很隐蔽：
+    #   ① 这类信号永久卡在「追踪中」，仪表盘永远显示为持仓；
+    #   ② 统计只覆盖「触及过事件」的信号，等于把「一直没走出去的单子」
+    #      从样本里剔除了 → 胜率被系统性高估（幸存者偏差）。
+    # 超时单本身就是信息：它说明信号进场后既没走对也没走错，是死单。
+    if len(bars) >= max_bars:
+        last = float(bars["Close"].iloc[-1])
+        r_exp = ((last - entry) if long else (entry - last)) / r_size
+        return {"outcome": "EXP", "r": r_exp, "bars": len(bars),
+                "mfe": mfe, "mae": mae, "done": True}
     return {"outcome": "open", "r": 0.0, "bars": len(bars),
             "mfe": mfe, "mae": mae, "done": False}
 
@@ -1697,7 +1729,7 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
     for r in rows:
         by_tf.setdefault(r[1], []).append(r)
 
-    stats = {"open": 0, "SL": 0, "TP1": 0, "TP2": 0}
+    stats = {"open": 0, "SL": 0, "TP1": 0, "TP2": 0, "EXP": 0}
     cost_sum = 0.0                     # 本轮累计点差成本（R）
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     mb_cfg = cfg.get("outcome_max_bars") or _OUTCOME_MAX_BARS
@@ -1755,7 +1787,8 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
 
     log.info(
         f"[追踪] 本轮评估 {len(rows)} 笔 → 止损{stats.get('SL', 0)} "
-        f"TP1:{stats.get('TP1', 0)} TP2:{stats.get('TP2', 0)} 追踪中:{stats.get('open', 0)}"
+        f"TP1:{stats.get('TP1', 0)} TP2:{stats.get('TP2', 0)} "
+        f"超时结案:{stats.get('EXP', 0)} 追踪中:{stats.get('open', 0)}"
         f" | 点差成本 {cost_sum:.3f}R (spread={cfg.get('spread_usd', 0.2)})"
     )
     return stats
@@ -1822,6 +1855,117 @@ def outcome_stats(db_file: str) -> dict:
         "by_grade": by_grade,
         "by_outcome": by_outcome,
     }
+
+
+# ============================================================
+# 硬性风控闸门（STRATEGY_ROADMAP 第二优先级 2.2）
+# ============================================================
+_RISK_GATE_DEFAULTS = {
+    "enabled": True,
+    "daily_loss_limit_pct": 3.0,    # 单日已实现亏损 ≥ 账户 X% → 当日不再开新仓
+    "max_open_positions": 3,        # 同时最多持有 N 笔
+    "cooldown_after_losses": 3,     # 连续亏损 N 笔
+    "cooldown_hours": 4,            # → 强制冷静 M 小时
+}
+
+# 信号的「可执行窗口」：超过这个时间，当初的入场价/止损价早就失效，
+# 那笔信号不再算作「活持仓」。
+# 为什么必须和追踪窗口（_OUTCOME_MAX_BARS）分开：
+#   追踪窗口是**事后统计**用的（5m 要等 24 小时才能确认它没走出去 → 记 EXP）；
+#   这里数的是**事前风控**要防的「同时敞口」。拿 24 小时去数，会让闸门
+#   长期被历史僵尸信号误拦，反而把系统堵死。
+_ACTIONABLE_HOURS = {"5m": 2, "15m": 6, "1h": 24, "4h": 72, "1d": 168}
+
+
+def risk_gate(cfg: dict, db_file: str = None, now=None) -> dict:
+    """三道硬闸门：任一触发即暂停新信号。
+
+    为什么必须单独有这一层：历史两次爆仓 —— $680→$0（06-05 非农插针）、
+    $1200→$93（06-26 空头反弹、0.20 手重仓）—— 病因都**不是「信号不准」**，
+    而是「仓位远超账户承受 + 反弹中死扛」。信号层再准，这层缺失就是归零。
+    本闸门只干一件事：**在已经出错的日子，阻止你继续下注。**
+
+    口径说明：单笔风险 = account_equity × risk_per_trade_pct%（与
+    calc_position_size 同源），所以 R 可直接换算成美元，不需要假设手数。
+
+    返回 {"allowed": bool, "reasons": [...], "detail": {...}}
+    """
+    g = dict(_RISK_GATE_DEFAULTS)
+    g.update(cfg.get("risk_gate") or {})
+    now = now or datetime.now()
+    db_file = db_file or cfg.get("db_file", "signals.db")
+    eq = float(cfg.get("account_equity", 0) or 0)
+    risk_usd = eq * float(cfg.get("risk_per_trade_pct", 1.0) or 0) / 100.0
+    detail = {"equity": eq, "risk_per_trade_usd": risk_usd}
+
+    if not g.get("enabled", True):
+        return {"allowed": True, "reasons": [], "detail": detail, "disabled": True}
+
+    today = now.strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect(_db_path(db_file)) as conn:
+            rows = conn.execute(
+                "SELECT r_multiple, resolved_at FROM signal_outcomes"
+                " WHERE resolved_at IS NOT NULL ORDER BY resolved_at"
+            ).fetchall()
+            # 活持仓 = 未结案 且 仍在可执行窗口内（见 _ACTIONABLE_HOURS 说明）
+            open_rows = conn.execute(
+                "SELECT s.timeframe, s.ts FROM signal_outcomes o"
+                " JOIN signals s ON s.id = o.signal_id"
+                " WHERE o.resolved_at IS NULL"
+            ).fetchall()
+    except Exception as e:
+        # 读不到就不拦（宁可漏拦，也不要因为统计层故障把信号全堵死）
+        log.error(f"[风控] 读取失败，本轮放行: {e}")
+        return {"allowed": True, "reasons": [], "detail": detail, "error": str(e)}
+
+    open_n = 0
+    for tf_o, ts_o in open_rows:
+        try:
+            age_h = (now - pd.Timestamp(ts_o).to_pydatetime()).total_seconds() / 3600.0
+        except Exception:
+            age_h = 0.0                     # 时间解析不了就当它是活的（保守）
+        if age_h <= float(_ACTIONABLE_HOURS.get(tf_o, 24)):
+            open_n += 1
+
+    today_r = sum(float(r[0] or 0) for r in rows if str(r[1])[:10] == today)
+    today_usd = today_r * risk_usd
+    detail.update({"open_positions": open_n, "today_r": today_r,
+                   "today_usd": today_usd})
+    reasons = []
+
+    # ① 单日最大亏损熔断
+    limit_pct = float(g.get("daily_loss_limit_pct", 3.0) or 0)
+    if limit_pct > 0 and eq > 0:
+        limit_usd = eq * limit_pct / 100.0
+        detail["daily_limit_usd"] = limit_usd
+        if today_usd <= -limit_usd:
+            reasons.append(f"单日亏损熔断：今日已实现 {today_usd:+.2f} 美元"
+                           f"（{today_r:+.2f}R），已达限额 -{limit_usd:.2f}")
+
+    # ② 最大同时持仓
+    max_open = int(g.get("max_open_positions", 3) or 0)
+    if max_open > 0 and open_n >= max_open:
+        reasons.append(f"持仓已满：当前 {open_n} 笔未结案，上限 {max_open} 笔")
+
+    # ③ 连亏冷静期：最近 N 笔全亏 → 自最后一笔结案起冷静 M 小时
+    n_cool = int(g.get("cooldown_after_losses", 3) or 0)
+    if n_cool > 0 and len(rows) >= n_cool:
+        last_n = rows[-n_cool:]
+        if all(float(r[0] or 0) <= 0 for r in last_n):
+            try:
+                last_ts = datetime.fromisoformat(str(last_n[-1][1]))
+            except Exception:
+                last_ts = None
+            if last_ts is not None:
+                hrs = (now - last_ts).total_seconds() / 3600.0
+                need = float(g.get("cooldown_hours", 4) or 0)
+                detail["cooldown_hours_since"] = hrs
+                if hrs < need:
+                    reasons.append(f"连亏冷静期：最近 {n_cool} 笔全亏，"
+                                   f"距最后一笔仅 {hrs:.1f} 小时（需满 {need:g} 小时）")
+
+    return {"allowed": not reasons, "reasons": reasons, "detail": detail}
 
 
 # ============================================================
@@ -2098,6 +2242,15 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
     _write_status(cfg, results)
 
     # ---- 阶段 3：逐周期推送 ----
+    # 硬性风控闸门：本轮只算一次（读库 + 统计），循环内复用
+    gate = risk_gate(cfg)
+    if not gate["allowed"]:
+        log.warning(f"[风控] ⛔ 暂停开新仓 → {'；'.join(gate['reasons'])}")
+    else:
+        _d = gate.get("detail") or {}
+        log.info(f"[风控] ✅ 放行 | 持仓 {_d.get('open_positions', '?')} 笔 | "
+                 f"今日已实现 {_d.get('today_usd', 0.0):+.2f} 美元")
+
     for tf, (sig, last) in results.items():
         try:
             if sig == 0:
@@ -2115,14 +2268,17 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
                 log.info(f"[过滤] {tf} ADX {float(last.get('adx', 0) or 0):.1f} < {adx_gate} (震荡) → 跳过推送")
                 continue
 
-            # 去重：同一周期同一方向不重复推送
-            key = f"{tf}_{sig}"
+            # 去重：同一周期 + 同方向 + 同信号类型 不重复推送
+            # （旧版 key 只有 tf+sig，会把同一根K线上「先回踩后突破」的第二种丢掉）
+            _stype = last.get("signal_type", "") or ""
+            key = f"{tf}_{sig}_{_stype}"
             if state.get(key) == last.name.isoformat():
                 log.info(f"[信号] {tf} 已有推送，跳过")
                 continue
 
             # DB 级去重（第二道防线）：状态文件丢失/损坏时也能挡住重复推送
-            if _already_pushed(cfg.get("db_file", "signals.db"), tf, last.name.isoformat(), sig):
+            if _already_pushed(cfg.get("db_file", "signals.db"), tf,
+                               last.name.isoformat(), sig, _stype):
                 state[key] = last.name.isoformat()
                 log.info(f"[信号] {tf} 同K线已在库中(DB去重) → 跳过推送")
                 continue
@@ -2144,6 +2300,27 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
                 state[key] = last.name.isoformat()
                 log.info(f"[新闻] ⛔ 处于数据发布窗口「{ev_name}」→ 不推送 "
                          f"{tf} {'多' if sig > 0 else '空'}单")
+                continue
+
+            # 硬性风控闸门（Roadmap 2.2）—— 盈利单之后的三道门：
+            #   单日亏损熔断 / 持仓上限 / 连亏冷静期
+            # 仍写入 state 去重键：否则闸门解除后会把这段时间的信号
+            # 按旧 K 线补推一遍（那时价格早变了，等于凭空追单）。
+            if not gate["allowed"]:
+                state[key] = last.name.isoformat()
+                log.info(f"[风控] ⛔ 闸门触发 → 不推送 {tf} "
+                         f"{'多' if sig > 0 else '空'}单 | {'；'.join(gate['reasons'])}")
+                continue
+
+            # 时段过滤（Roadmap 2.4）：低流动性时段假突破多。
+            # 默认**关闭**（block_hours 为空）—— 因为「哪个时段真的差」应当由
+            # 本系统自己的实测数据说话，而不是照搬经验。仪表盘的「按小时表现」
+            # 面板就是为这个决策提供依据的（数据够了再开）。
+            _bh = cfg.get("block_hours") or []
+            if _bh and int(last.name.hour) in {int(h) for h in _bh}:
+                state[key] = last.name.isoformat()
+                log.info(f"[时段] ⏰ {int(last.name.hour)}点 属于过滤时段 {_bh}"
+                         f" → 不推送 {tf} {'多' if sig > 0 else '空'}单")
                 continue
 
             title, content = format_signal_msg(tf, sig, last, cfg, resonance_tfs=res_tfs)

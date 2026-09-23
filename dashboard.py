@@ -14,21 +14,41 @@
   uvicorn dashboard:app --host 0.0.0.0 --port 1689
 """
 import json
+import logging
+import os
+import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+_security = HTTPBasic(auto_error=False)
+
+log = logging.getLogger("dashboard")
+if not log.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
 
 BASE = Path(__file__).parent
 
 
 def _cfg() -> dict:
+    """读取配置。
+
+    这里**必须**报错而不是静默返回 {}：配置读不到时，account_equity 等
+    会退回默认值，仪表盘照常渲染 —— 但显示的权益/盈亏全是错的，
+    没有任何迹象提示你。静默失败在这里比崩溃更危险。
+    """
     try:
         with open(BASE / "dpb_config.json", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        log.error(f"读取 dpb_config.json 失败（仪表盘数值可能不准）: {e}")
         return {}
 
 
@@ -44,8 +64,10 @@ def _status() -> dict:
         try:
             with open(p, encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"读取状态快照 {p.name} 失败（将显示为空快照）: {e}")
+    else:
+        log.warning(f"状态快照 {p.name} 不存在（监控进程可能没在跑）")
     return {"updated_at": None, "timeframes": {}, "ticker": None}
 
 
@@ -64,7 +86,80 @@ def _query(sql: str, args: tuple = ()) -> list:
         return []
 
 
-app = FastAPI(title="XAUMonitor Dashboard")
+# ============================================================
+# 鉴权（HTTP Basic）
+# ============================================================
+# 为什么必须做：这个仪表盘经 Nginx 8088 暴露在**公网**，
+# 上面有账户权益、信号明细、止损止盈价位。没有鉴权 = 任何人可看。
+# 为什么没配置时自动生成而不是「放行」：默认敞开是更糟的失败方式。
+# 密码写入 gitignored 的 dpb_config.json —— 不进仓库、不进日志。
+_AUTH = {"user": None, "pw": None, "mtime": 0.0}
+
+
+def _auth_creds() -> tuple:
+    """返回 (用户名, 密码)；配置里没有则随机生成并写回配置（只做一次）。"""
+    cfg_path = BASE / "dpb_config.json"
+    try:
+        mt = cfg_path.stat().st_mtime
+    except OSError:
+        mt = 0.0
+    if _AUTH["user"] and _AUTH["mtime"] == mt:
+        return _AUTH["user"], _AUTH["pw"]
+
+    cfg = _cfg()
+    auth = ((cfg.get("dashboard") or {}).get("auth") or {})
+    user, pw = auth.get("user"), auth.get("password")
+    if user and pw:
+        _AUTH.update(user=user, pw=pw, mtime=mt)
+        return user, pw
+
+    user = user or "zeus"
+    pw = secrets.token_urlsafe(12)
+    cfg.setdefault("dashboard", {}).setdefault("auth", {})
+    cfg["dashboard"]["auth"].update({"user": user, "password": pw})
+    try:
+        tmp = cfg_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, cfg_path)          # 原子替换，避免写坏生产配置
+        log.warning("仪表盘启用了登录但未配置密码 → 已生成随机密码写入 "
+                    "dpb_config.json 的 dashboard.auth（文件已 gitignore）。"
+                    "本日志不打印明文。")
+        mt = cfg_path.stat().st_mtime
+    except Exception as e:
+        log.error(f"写入仪表盘密码失败（本次仍启用该密码）: {e}")
+    _AUTH.update(user=user, pw=pw, mtime=mt)
+    return user, pw
+
+
+def _auth_enabled() -> bool:
+    """仪表盘是否要登录。**默认关闭**——这个面板本来就是开放出来看的。"""
+    a = ((_cfg().get("dashboard") or {}).get("auth") or {})
+    return bool(a.get("enabled", False))
+
+
+def _require_auth(creds: HTTPBasicCredentials = Depends(_security)):
+    """全站鉴权（可选）。
+
+    默认**不启用**：这块面板的设计意图就是"开放出来看"。想在公网加锁时，
+    在 dpb_config.json 里写：
+        "dashboard": {"auth": {"enabled": true, "user": "...", "password": "..."}}
+    只写 enabled=true 而不给密码，会自动生成一个随机密码并写回配置。
+    """
+    if not _auth_enabled():
+        return True
+    user, pw = _auth_creds()
+    if creds and secrets.compare_digest(creds.username, user) \
+            and secrets.compare_digest(creds.password, pw):
+        return True
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="需要登录",
+        headers={"WWW-Authenticate": 'Basic realm="XAUMonitor"'},
+    )
+
+
+app = FastAPI(title="XAUMonitor Dashboard", dependencies=[Depends(_require_auth)])
 
 
 @app.get("/api/stats")
@@ -197,20 +292,48 @@ def _oz_per_trade(cfg: dict) -> float:
     return _num(cfg, "min_lot", 0.01) * _num(cfg, "contract_oz", 100.0)
 
 
-def _pnl_usd(r: dict, oz: float) -> float:
-    """单笔盈亏（美元）。
+def _pnl_usd(r: dict, oz: float):
+    """单笔盈亏（美元）；数据不完整时返回 **None**（而不是 0）。
 
-    net_r 是「以止损距离为 1R」的净倍数（已扣点差），
-    所以 价格波动 = net_r × 止损距离，盈亏 = 价格波动 × 盎司数。
+    net_r 是「以止损距离为 1R」的净倍数（已扣点差），所以
+    价格波动 = net_r × 止损距离，盈亏 = 价格波动 × 盎司数。
+
+    为什么返回 None 而不是 0.0：
+      算美元必须同时拿到 r_multiple / entry / sl。旧版缺列时
+      `float(x or 0.0)` 把「缺失」静默当成 0 —— 于是「算不出来」和
+      「不赚不亏」长得一模一样。/api/charts 漏选 entry/sl 时，
+      权益曲线就这样变成一条 650 的平线，而退化区间还让它看起来
+      像一张正常图表。宁可返回 None，让调用方显式处理。
     """
-    try:
-        rr = float(r.get("r_multiple") or 0.0)
-        entry = float(r.get("entry") or 0.0)
-        sl = float(r.get("sl") or 0.0)
-        risk = abs(entry - sl)
-        return rr * risk * oz
-    except Exception:
-        return 0.0
+    if r.get("r_multiple") is None:
+        return None
+    entry, sl = r.get("entry"), r.get("sl")
+    if entry is None or sl is None:
+        return None
+    risk = abs(float(entry) - float(sl))
+    if risk < 1e-9:
+        return None
+    return float(r["r_multiple"]) * risk * oz
+
+
+def _sum_pnl(rs, oz, where="") -> float:
+    """汇总一组信号的美元盈亏；跳过数据不全的，并把它**显式记进日志**。
+
+    与 _pnl_usd 配套：把「算不出来」暴露出来，而不是静默当 0 累加
+    （那正是权益曲线变成平线却没人发现的原因）。
+    """
+    tot, bad = 0.0, 0
+    for r in rs:
+        v = _pnl_usd(r, oz)
+        if v is None:
+            bad += 1
+            v = 0.0          # 归一成 0，让调用方的 sum() 不会炸
+        tot += v
+        r["pnl_usd"] = v
+    if bad:
+        log.warning(f"{where} {bad} 笔信号缺 r_multiple/entry/sl，"
+                    f"美元换算按 0 计入（合计会偏小）")
+    return tot
 
 
 def _is_closed(r: dict) -> bool:
@@ -266,8 +389,11 @@ def _live_xau(snapshot: dict, cfg: dict):
                 if diff is not None and abs(diff) < 50:
                     age = (datetime.now().timestamp() * 1000 - float(row[1])) / 1000
                     return float(row[0]) + diff, f"PAXG实时+价差{abs(age) < 90 and '（新鲜）' or ''}"
-        except Exception:
-            pass
+        except Exception as e:
+            # 实时价只是「更好看的估计」，失败就退回快照价 —— 属预期内的降级。
+            # 但仍记 debug 日志：若它长期失败，说明 PAXG 库/库结构出了问题，
+            # 那时仪表盘的「实时」标签就是假的，必须有迹可循。
+            log.debug(f"实时价估算失败，退回快照价: {e}")
     return xau, "XAU/USD 快照"
 
 
@@ -307,7 +433,7 @@ def api_equity():
                 r["float_r"] = 0.0
             openpos.append(r)
 
-    realized = sum(x["pnl_usd"] for x in closed)
+    realized = _sum_pnl(closed, oz, "[equity]")
     unrealized = sum(x["float_pnl_usd"] or 0.0 for x in openpos)
     realized_r = sum(float(x["r_multiple"] or 0) for x in closed)
     wins = [x for x in closed if (x["r_multiple"] or 0) > 0]
@@ -359,7 +485,6 @@ def api_daily(page: int = 1, per_page: int = 5):
         if d not in days_map:
             days_map[d] = []
             order.append(d)
-        r["pnl_usd"] = _pnl_usd(r, oz)
         r["closed"] = _is_closed(r)
         days_map[d].append(r)
 
@@ -369,7 +494,7 @@ def api_daily(page: int = 1, per_page: int = 5):
     for d in order:
         sigs = days_map[d]
         closed = [x for x in sigs if x["closed"]]
-        day_real = sum(x["pnl_usd"] for x in closed)
+        day_real = _sum_pnl(closed, oz, f"[daily {d}]")
         cum += day_real
         wins = len([x for x in closed if (x["r_multiple"] or 0) > 0])
         days.append({
@@ -400,6 +525,165 @@ def api_daily(page: int = 1, per_page: int = 5):
         "initial_equity": init,
         "oz_per_trade": oz,
         "days": days[start:start + per_page],
+    }
+
+
+# ============================================================
+# E2 图表：服务端生成内联 SVG
+# ============================================================
+# 为什么自己画 SVG 而不引 Chart.js/ECharts：
+#   ① 这页是公网访问的手机页面，多一个 CDN 就多一个加载失败点（国内尤甚）；
+#   ② 图表要的东西很少（折线 + 柱状），几百行内联 SVG 足够，还省一次渲染抖动；
+#   ③ viewBox + width:100% 天然自适应，桌面手机同一套代码。
+def _esc(s) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _svg_line(pts, w=660, h=150, pad=26, base=None, fmt="{:.2f}"):
+    """累积曲线。pts: [(label, value)]；base: 参考基准线（如初始资金）。"""
+    if len(pts) < 2:
+        return '<div class="muted ch-empty">数据不足，画不出曲线</div>'
+    vals = [v for _, v in pts]
+    lo, hi = min(vals), max(vals)
+    if base is not None:
+        lo, hi = min(lo, base), max(hi, base)
+    if hi - lo < 1e-9:
+        hi, lo = hi + 1, lo - 1
+    span = hi - lo
+    lo, hi = lo - span * 0.08, hi + span * 0.08   # 上下留白
+    span = hi - lo
+    iw, ih = w - pad * 2, h - pad * 2
+
+    def X(i):
+        return pad + iw * i / (len(pts) - 1)
+
+    def Y(v):
+        return pad + ih * (1 - (v - lo) / span)
+
+    line = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, (_, v) in enumerate(pts))
+    area = f"{pad},{pad+ih} " + line + f" {pad+iw},{pad+ih}"
+    out = [f'<svg class="chart" viewBox="0 0 {w} {h}" preserveAspectRatio="none">',
+           '<defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1">'
+           '<stop offset="0%" stop-color="#3fb950" stop-opacity="0.34"/>'
+           '<stop offset="100%" stop-color="#3fb950" stop-opacity="0"/></linearGradient></defs>']
+    if base is not None and lo <= base <= hi:
+        by = Y(base)
+        out.append(f'<line x1="{pad}" y1="{by:.1f}" x2="{pad+iw}" y2="{by:.1f}"'
+                   ' stroke="#8b949e" stroke-width="1" stroke-dasharray="5,4"/>')
+        out.append(f'<text x="{pad+3}" y="{by-4:.1f}" fill="#8b949e" font-size="12">'
+                   f'{_esc(fmt.format(base))}</text>')
+    out.append(f'<polygon points="{area}" fill="url(#eqg)"/>')
+    out.append(f'<polyline points="{line}" fill="none" stroke="#3fb950"'
+               ' stroke-width="2" stroke-linejoin="round"/>')
+    lx, ly = X(len(pts) - 1), Y(pts[-1][1])
+    out.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="#3fb950"/>')
+    out.append(f'<text x="{pad}" y="12" fill="#8b949e" font-size="12">'
+               f'{_esc(fmt.format(hi))}</text>')
+    out.append(f'<text x="{pad}" y="{h-6}" fill="#8b949e" font-size="12">'
+               f'{_esc(fmt.format(lo))}</text>')
+    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#8b949e" font-size="12"'
+               ' text-anchor="end">' + _esc(pts[-1][0]) + '</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _svg_bars(pts, w=660, h=140, pad=26, fmt="{:.2f}", unit=""):
+    """柱状图（正绿负红）。pts: [(label, value)]"""
+    if not pts:
+        return '<div class="muted ch-empty">暂无数据</div>'
+    vals = [v for _, v in pts]
+    mx = max(abs(v) for v in vals) or 1.0
+    iw, ih = w - pad * 2, h - pad * 2
+    bw = max(2.0, iw / len(pts) * 0.68)
+    zero = pad + ih / 2
+    sc = (ih / 2) / (mx * 1.12)
+    out = [f'<svg class="chart" viewBox="0 0 {w} {h}" preserveAspectRatio="none">',
+           f'<line x1="{pad}" y1="{zero:.1f}" x2="{pad+iw}" y2="{zero:.1f}"'
+           ' stroke="#30363d" stroke-width="1"/>']
+    for i, (_, v) in enumerate(pts):
+        cx = pad + iw * (i + 0.5) / len(pts)
+        bh = abs(v) * sc
+        y = zero - bh if v >= 0 else zero
+        col = "#3fb950" if v >= 0 else "#f85149"
+        out.append(f'<rect x="{cx-bw/2:.1f}" y="{y:.1f}" width="{bw:.1f}"'
+                   f' height="{max(bh,0.6):.1f}" fill="{col}" rx="1.5"/>')
+    out.append(f'<text x="{pad}" y="12" fill="#8b949e" font-size="12">'
+               f'±{_esc(fmt.format(mx))}{_esc(unit)}</text>')
+    out.append(f'<text x="{pad}" y="{h-6}" fill="#8b949e" font-size="12">'
+               f'{_esc(pts[0][0])}</text>')
+    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#8b949e" font-size="12"'
+               f' text-anchor="end">{_esc(pts[-1][0])}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+@app.get("/api/charts")
+def api_charts():
+    """图表数据：累积权益曲线 / 逐日盈亏 / 按小时期望 / 信号分布。
+
+    全部由 signals.db + signal_outcomes 现算，零 API 消耗。
+    """
+    cfg = _cfg()
+    init = _num(cfg, "account_equity", 650.0)
+    rows = _query(
+        "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.pushed_at,"
+        " s.entry, s.sl,"
+        " o.outcome, o.r_multiple, o.resolved_at, o.cost_r"
+        " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+        " ORDER BY s.id")
+    oz = _oz_per_trade(cfg)
+    days = {}
+    for r in rows:
+        d = (r.get("pushed_at") or "")[:10]
+        if not d:
+            continue
+        days.setdefault(d, []).append(r)
+
+    # ---- 累积权益曲线 + 逐日金额 ----
+    # 不用手写循环累加，统一走 _sum_pnl（单一来源，避免再出现「某个面板
+    # 漏了 entry/sl 就静默算成 0」这类问题）
+    cum, eq_pts, day_pts = init, [], []
+    for d in sorted(days):
+        usd = _sum_pnl([r for r in days[d] if r.get("resolved_at")], oz, f"[charts {d}]")
+        cum += usd
+        eq_pts.append((d[5:], cum))
+        day_pts.append((d[5:], usd))
+
+    # ---- 按小时：期望 R（供「时段过滤」决策用，数据说话）----
+    hours = {}
+    for r in rows:
+        if not r.get("resolved_at") or r.get("r_multiple") is None:
+            continue
+        hh = (r.get("pushed_at") or "")[11:13]
+        if not hh.isdigit():
+            continue
+        hours.setdefault(int(hh), []).append(float(r["r_multiple"]))
+    hour_pts = [(f"{h}点", sum(v) / len(v)) for h, v in sorted(hours.items()) if len(v) >= 2]
+
+    # ---- 分布 ----
+    def _count(fn):
+        c = {}
+        for r in rows:
+            k = fn(r)
+            if k:
+                c[k] = c.get(k, 0) + 1
+        return c
+
+    dist = {
+        "grade": _count(lambda r: r.get("grade")),
+        "type": _count(lambda r: r.get("sig_type")),
+        "tf": _count(lambda r: r.get("timeframe")),
+        "outcome": _count(lambda r: r.get("outcome") if r.get("resolved_at") else "open"),
+        "hour_n": {f"{h}点": len(v) for h, v in sorted(hours.items())},
+    }
+    return {
+        "equity_svg": _svg_line(eq_pts, base=init),
+        "daily_svg": _svg_bars(day_pts, fmt="{:+.2f}", unit=" USD"),
+        "hour_svg": _svg_bars(hour_pts, fmt="{:+.2f}", unit=" R/笔"),
+        "samples": {"days": len(days), "resolved": sum(
+            1 for r in rows if r.get("resolved_at")),
+            "hour_points": len(hour_pts)},
+        "dist": dist,
     }
 
 
@@ -508,6 +792,16 @@ HTML_PAGE = """<!DOCTYPE html>
                   border-radius:8px; padding:8px 16px; font-size:15px; font-weight:700; cursor:pointer; }
   .pager button:disabled { opacity:.3; cursor:default; }
   .pager .pg { color:var(--mut); font-size:14px; min-width:96px; text-align:center; }
+  /* 图表（服务端 SVG，无外部依赖） */
+  /* max-width 上限：viewBox 是 660 宽，桌面容器 1200+ 时若不设上限，
+     SVG 会被拉伸到 1.8 倍，图内 10px 文字变成 18px 大字、比例失衡。
+     限到 720 后放大倍率≈1.09，配 12px 字号在桌面正好，窄屏则是等比缩小。 */
+  .chart { display:block; width:100%; max-width:720px; height:auto; margin:0 auto; }
+  .ch-empty { padding:14px 0; text-align:center; font-size:13px; }
+  .ch-wrap { background:var(--card); border:1px solid var(--border); border-radius:12px;
+             padding:10px 12px 7px; margin-bottom:10px; }
+  .ch-wrap h3 { margin:0 0 3px; font-size:14px; font-weight:700; }
+  .ch-wrap .sub { font-size:12px; color:var(--mut); margin:0 0 7px; line-height:1.45; }
   @media (max-width:600px){
     h1{ font-size:19px; }
     .wrap{ padding:10px 9px 22px; }
@@ -543,6 +837,34 @@ HTML_PAGE = """<!DOCTYPE html>
         style="font-weight:400;font-size:13px"></span></h2>
     <div class="cards" id="eqCards"></div>
     <div id="posWrap" style="margin-top:10px"></div>
+  </section>
+
+  <!-- 图表：权益曲线 / 逐日 / 按小时 -->
+  <section>
+    <h2>📈 走势</h2>
+    <div class="ch-wrap">
+      <h3>累积权益曲线</h3>
+      <div class="sub">初始资金 → 现在。只累加<b>已结案</b>信号，按实测 R 换算成美元
+        （虚线 = 初始资金）。浮动盈亏不计入曲线。</div>
+      <div id="eqChart"></div>
+    </div>
+    <div class="ch-wrap">
+      <h3>逐日盈亏</h3>
+      <div class="sub">每根柱子 = 该日已结案信号的美元合计。绿盈红亏。</div>
+      <div id="dayChart"></div>
+    </div>
+    <div class="ch-wrap">
+      <h3>按小时期望值
+        <span class="muted" style="font-weight:400;font-size:12px">— 用来决定要不要开时段过滤</span></h3>
+      <div class="sub">每根柱子 = 该小时全部已结案信号的<b>平均净 R</b>。
+        样本不足 2 笔的小时不画。数据够多且某时段长期为负，才值得在配置里开
+        <code>block_hours</code>；现在默认不开。</div>
+      <div id="hourChart"></div>
+    </div>
+    <div class="ch-wrap">
+      <h3>信号分布</h3>
+      <div id="distBox" class="sub" style="margin-bottom:2px"></div>
+    </div>
   </section>
 
   <div class="main">
@@ -585,13 +907,14 @@ const cls = v => (Number(v||0)>=0 ? 'up' : 'dn');
 
 async function load(){
   try{
-    const [st, sy, oc, eq, dl] = await Promise.all([
+    const [st, sy, oc, eq, dl, ch] = await Promise.all([
       fetch('/api/stats').then(r=>r.json()),
       fetch('/api/status').then(r=>r.json()),
       fetch('/api/outcomes').then(r=>r.json()).catch(()=>({closed:0})),
       fetch('/api/equity').then(r=>r.json()).catch(()=>({})),
       fetch('/api/daily?page='+dailyPage+'&per_page='+DAY_PER_PAGE)
         .then(r=>r.json()).catch(()=>({days:[],pages:1})),
+      fetch('/api/charts').then(r=>r.json()).catch(()=>({})),
     ]);
 
     // 顶栏
@@ -700,6 +1023,31 @@ async function load(){
       mk('结案/追踪', eq.closed+' / '+eq.tracking, '');
     }
 
+    // ================= 图表（服务端生成的 SVG，直接注入） =================
+    const OUT_LBL={SL:'❌止损', TP1:'✅TP1', TP2:'🏆TP2', EXP:'⏱超时', open:'⏳持仓中'};
+    const eqc=document.getElementById('eqChart');
+    const dyc=document.getElementById('dayChart');
+    const hrc=document.getElementById('hourChart');
+    const dbox=document.getElementById('distBox');
+    if(ch && ch.equity_svg){
+      eqc.innerHTML=ch.equity_svg;
+      dyc.innerHTML=ch.daily_svg;
+      hrc.innerHTML=ch.hour_svg;
+      const d=ch.dist||{};
+      const kv=(o,lab)=>{const e=Object.entries(o||{});
+        if(!e.length) return '—';
+        return e.sort((a,b)=>b[1]-a[1])
+                .map(([k,v])=>(lab?lab(k):k)+' '+v).join(' · ');};
+      dbox.innerHTML =
+        '<b>结局</b> '   + kv(d.outcome, k=>OUT_LBL[k]||k) + '<br>'
+      + '<b>类型</b> '   + kv(d.type)  + '<br>'
+      + '<b>等级</b> '   + kv(d.grade) + '<br>'
+      + '<b>周期</b> '   + kv(d.tf);
+    }else{
+      eqc.innerHTML='<div class="muted ch-empty">图表数据加载失败（看服务日志）</div>';
+      dyc.innerHTML=''; hrc.innerHTML=''; dbox.textContent='—';
+    }
+
     // ================= 持仓中（实时浮动） =================
     const pw = document.getElementById('posWrap'); pw.innerHTML='';
     const pos = eq.open_positions||[];
@@ -765,7 +1113,9 @@ async function load(){
       box.appendChild(h);
 
       const b=E('div','daybody');
-      const OUT2={SL:['❌止损','dn'], TP1:['✅TP1','up'], TP2:['🏆TP2','up'], open:['⏳持仓','']};
+      // EXP = 超时结案：窗口走满、既没碰止损也没碰止盈的死单（按末根收盘价计R）
+      const OUT2={SL:['❌止损','dn'], TP1:['✅TP1','up'], TP2:['🏆TP2','up'],
+                  EXP:['⏱超时','mu'], open:['⏳持仓','']};
       (day.signals||[]).slice().reverse().forEach(s=>{
         const r=E('div','row-sig');
         r.appendChild(E('span','id','#'+s.id));
