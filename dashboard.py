@@ -7,6 +7,8 @@
   - 最近信号明细表
   - 各周期实时状态快照（趋势 / RSI / ATR / 信号）
   - 配置摘要
+  - 【资金与盈亏】初始资金 → 当前权益，已实现 + 持仓浮动（实时价估算）
+  - 【按日分区】信号按自然日归组，逐日胜负/当日R/当日金额/累计权益，可翻页
 
 用法:
   uvicorn dashboard:app --host 0.0.0.0 --port 1689
@@ -55,7 +57,10 @@ def _query(sql: str, args: tuple = ()) -> list:
         with sqlite3.connect(db) as conn:
             conn.row_factory = sqlite3.Row
             return [dict(r) for r in conn.execute(sql, args).fetchall()]
-    except Exception:
+    except Exception as e:
+        # 【不要再静默吞掉】曾因 s.resolved_at 写错表名而整表返回空，
+        # 页面显示「0 笔」，排查绕了一大圈。出错必须看得见。
+        print(f"[dashboard] SQL 失败: {type(e).__name__}: {e}")
         return []
 
 
@@ -173,6 +178,231 @@ def api_status():
     }
 
 
+# ============================================================
+# 资金与盈亏（用户口径：固定 0.01 手 = 1 盎司 → 价格每波动 $1 = 盈亏 $1）
+# ============================================================
+def _num(cfg: dict, key: str, default: float) -> float:
+    try:
+        return float(cfg.get(key, default))
+    except Exception:
+        return float(default)
+
+
+def _oz_per_trade(cfg: dict) -> float:
+    """每单手数对应的盎司数。
+
+    用户实盘口径：min_lot=0.01 手、contract_oz=100（1手=100盎司）
+    → 每笔 0.01 × 100 = 1 盎司 → 价格每波动 1 美元，盈亏就是 1 美元。
+    """
+    return _num(cfg, "min_lot", 0.01) * _num(cfg, "contract_oz", 100.0)
+
+
+def _pnl_usd(r: dict, oz: float) -> float:
+    """单笔盈亏（美元）。
+
+    net_r 是「以止损距离为 1R」的净倍数（已扣点差），
+    所以 价格波动 = net_r × 止损距离，盈亏 = 价格波动 × 盎司数。
+    """
+    try:
+        rr = float(r.get("r_multiple") or 0.0)
+        entry = float(r.get("entry") or 0.0)
+        sl = float(r.get("sl") or 0.0)
+        risk = abs(entry - sl)
+        return rr * risk * oz
+    except Exception:
+        return 0.0
+
+
+def _is_closed(r: dict) -> bool:
+    """是否真正结案 —— 判据是 resolved_at，不能只看 outcome。
+
+    TP1 已到但还没到 TP2、追踪窗口也没走满时，单子仍在跑，属追踪中。
+    """
+    return bool(r.get("resolved_at"))
+
+
+def _live_xau(snapshot: dict, cfg: dict):
+    """尽量实时的 XAU 价格估计。
+
+    两层：
+      1) 权威层：监控端快照里各周期的收盘价（XAU/USD 真实行情，但最多 4 分钟旧）
+      2) 实时层：Binance PAXG 的最新成交价 + 与 XAU 的价差修正
+    PAXG 是稀薄市场的代理品、会与 XAU 有 $2-6 的价差，所以必须先修正再当价格用。
+    返回 (price, source_zh)。
+    """
+    tfs = (snapshot or {}).get("timeframes") or {}
+    xau = None
+    for tf in ("5m", "15m", "1h", "4h", "1d"):
+        d = tfs.get(tf) or {}
+        if d.get("close"):
+            xau = float(d["close"])
+            break
+    if xau is None:
+        return None, "无快照"
+    # 实时层：PAXG 最新价 + 价差
+    paxg_db = BASE / "paxg_stream.db"
+    if paxg_db.exists():
+        try:
+            with sqlite3.connect(paxg_db) as conn:
+                row = conn.execute(
+                    "SELECT price, ts_ms FROM trades ORDER BY ts_ms DESC LIMIT 1").fetchone()
+                # 用最近 30 分钟逐分钟中位数算价差（抗单点插针）
+                bars = conn.execute(
+                    "SELECT open_ms, close FROM klines_1m WHERE closed=1"
+                    " ORDER BY open_ms DESC LIMIT 35").fetchall()
+            if row:
+                # 价差锚点：快照那个周期K线的收盘分钟
+                d = tfs.get("5m") or tfs.get("15m") or {}
+                anchor = str(d.get("bar_time") or "")[:16]
+                diff = None
+                if anchor:
+                    for ms, c in bars:
+                        if c and datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M") == anchor:
+                            diff = xau - float(c)
+                            break
+                if diff is None and bars:
+                    # 锚点对不上时用最近一根，误差可接受（仅用于展示）
+                    diff = xau - float(bars[0][1])
+                if diff is not None and abs(diff) < 50:
+                    age = (datetime.now().timestamp() * 1000 - float(row[1])) / 1000
+                    return float(row[0]) + diff, f"PAXG实时+价差{abs(age) < 90 and '（新鲜）' or ''}"
+        except Exception:
+            pass
+    return xau, "XAU/USD 快照"
+
+
+@app.get("/api/equity")
+def api_equity():
+    """初始金额 → 现在的盈亏：已实现 + 浮动（含持仓中逐笔）"""
+    cfg = _cfg()
+    oz = _oz_per_trade(cfg)
+    init = _num(cfg, "account_equity", 650.0)
+    rows = _query(
+        "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.score, s.entry, s.sl,"
+        " s.tp1, s.tp2, s.pushed_at, o.resolved_at,"
+        " o.outcome, o.r_multiple, o.cost_r, o.bars"
+        " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+        " ORDER BY s.id"
+    )
+    snap = _status()
+    live, src = _live_xau(snap, cfg)
+
+    closed, openpos = [], []
+    for r in rows:
+        pnl = _pnl_usd(r, oz)
+        risk = abs(float(r["entry"] or 0) - float(r["sl"] or 0))
+        r["risk_usd"] = risk * oz
+        r["pnl_usd"] = pnl
+        if _is_closed(r):
+            closed.append(r)
+        elif (r.get("outcome") or "open") != "SL":
+            # 追踪中：用实时价估浮动盈亏
+            if live and r["direction"]:
+                move = (live - float(r["entry"])) * int(r["direction"])
+                r["float_pnl_usd"] = move * oz
+                r["float_r"] = move / risk if risk else 0.0
+                r["live_price"] = live
+            else:
+                r["float_pnl_usd"] = 0.0
+                r["float_r"] = 0.0
+            openpos.append(r)
+
+    realized = sum(x["pnl_usd"] for x in closed)
+    unrealized = sum(x["float_pnl_usd"] or 0.0 for x in openpos)
+    realized_r = sum(float(x["r_multiple"] or 0) for x in closed)
+    wins = [x for x in closed if (x["r_multiple"] or 0) > 0]
+    gross_win = sum(x["pnl_usd"] for x in wins)
+    gross_loss = abs(sum(x["pnl_usd"] for x in closed if (x["r_multiple"] or 0) <= 0))
+
+    return {
+        "initial_equity": init,
+        "oz_per_trade": oz,
+        "equity_realized": init + realized,
+        "equity_total": init + realized + unrealized,
+        "realized_usd": realized,
+        "unrealized_usd": unrealized,
+        "realized_r": realized_r,
+        "return_pct": (realized + unrealized) / init * 100 if init else 0.0,
+        "closed": len(closed),
+        "tracking": len(openpos),
+        "wins": len(wins),
+        "losses": len(closed) - len(wins),
+        "win_rate": (len(wins) / len(closed) * 100) if closed else None,
+        "avg_win_usd": (gross_win / len(wins)) if wins else 0.0,
+        "avg_loss_usd": (-gross_loss / (len(closed) - len(wins))) if closed and len(closed) > len(wins) else 0.0,
+        "profit_factor": (gross_win / gross_loss) if gross_loss else None,
+        "live_price": live,
+        "live_source": src,
+        "open_positions": openpos,
+    }
+
+
+@app.get("/api/daily")
+def api_daily(page: int = 1, per_page: int = 5):
+    """按自然日分区 + 分页，逐日给出当日与累计盈亏。"""
+    cfg = _cfg()
+    oz = _oz_per_trade(cfg)
+    init = _num(cfg, "account_equity", 650.0)
+    rows = _query(
+        "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.score, s.entry, s.sl,"
+        " s.tp1, s.tp2, s.pushed_at, o.resolved_at,"
+        " o.outcome, o.r_multiple, o.cost_r"
+        " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+        " ORDER BY s.pushed_at, s.id"
+    )
+
+    # 按自然日归组（用推送日期，保证「当日出了什么信号」一目了然）
+    days_map = {}
+    order = []
+    for r in rows:
+        d = str(r.get("pushed_at") or "")[:10] or "未知"
+        if d not in days_map:
+            days_map[d] = []
+            order.append(d)
+        r["pnl_usd"] = _pnl_usd(r, oz)
+        r["closed"] = _is_closed(r)
+        days_map[d].append(r)
+
+    # 按时间顺序累计（累计口径必须时间正序，否则曲线会错）
+    cum = init
+    days = []
+    for d in order:
+        sigs = days_map[d]
+        closed = [x for x in sigs if x["closed"]]
+        day_real = sum(x["pnl_usd"] for x in closed)
+        cum += day_real
+        wins = len([x for x in closed if (x["r_multiple"] or 0) > 0])
+        days.append({
+            "date": d,
+            "n": len(sigs),
+            "n_closed": len(closed),
+            "n_open": len(sigs) - len(closed),
+            "wins": wins,
+            "losses": len(closed) - wins,
+            "day_r": sum(float(x["r_multiple"] or 0) for x in closed),
+            "day_usd": day_real,
+            "equity_end": cum,
+            "signals": sigs,
+        })
+
+    days.reverse()                       # 页面展示：最新的一天在最上面
+    total = len(days)
+    per_page = max(1, min(int(per_page), 31))
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(int(page), pages))
+    start = (page - 1) * per_page
+
+    return {
+        "page": page,
+        "per_page": per_page,
+        "pages": pages,
+        "total_days": total,
+        "initial_equity": init,
+        "oz_per_trade": oz,
+        "days": days[start:start + per_page],
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML_PAGE
@@ -198,8 +428,10 @@ HTML_PAGE = """<!DOCTYPE html>
   section { margin-bottom:14px; }
   /* 顶部指标条：紧凑，一屏放得下 */
   .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(104px,1fr)); gap:8px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:9px 12px; }
-  .card .v { font-size:23px; font-weight:800; line-height:1.15; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
+          padding:9px 12px; min-width:0; }
+  .card .v { font-size:23px; font-weight:800; line-height:1.15;
+              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .card .l { color:var(--mut); font-size:12px; margin-top:1px; }
   /* 数据发布窗口告警卡：必须一眼可见 */
   .card.warn { background:#3d1d1d; border-color:#f85149; }
@@ -235,12 +467,63 @@ HTML_PAGE = """<!DOCTYPE html>
   .muted{color:var(--mut);font-size:14px}
   .big{font-size:19px;font-weight:800}
   .foot{text-align:center;padding:8px 0 18px;font-size:12px;color:var(--mut)}
-  @media (max-width:430px){
+  /* 资金与盈亏 */
+  .card.good .v{ color:var(--green); } .card.bad .v{ color:var(--red); }
+  /* 按日分区 */
+  .day { background:var(--card); border:1px solid var(--border); border-radius:12px;
+         margin-bottom:10px; overflow:hidden; }
+  .dayhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:10px 13px; background:#1b2230; border-bottom:1px solid var(--border);
+             cursor:pointer; user-select:none; }
+  .dayhead .dt { font-size:17px; font-weight:800; }
+  .dayhead .caret { color:var(--mut); font-size:12px; }
+  .dayhead .sp { margin-left:auto; display:flex; gap:11px; flex-wrap:wrap;
+                 font-size:13px; color:var(--mut); }
+  .dayhead .sp b { font-weight:800; }
+  .up{ color:var(--green); } .dn{ color:var(--red); }
+  .daybody { padding:6px 13px 10px; }
+  .day.collapsed .daybody { display:none; }
+  .row-sig { display:grid; grid-template-columns:38px 74px 1fr auto auto;
+             gap:8px; align-items:center; font-size:14px; padding:5px 0;
+             border-bottom:1px dashed #232a35; }
+  .row-sig:last-child { border-bottom:0; }
+  .row-sig .id { color:var(--mut); font-size:12px; }
+  .row-sig .mid { display:flex; gap:7px; align-items:center; flex-wrap:wrap; }
+  .row-sig .res { font-size:13px; font-weight:700; }
+  .row-sig .pnl { text-align:right; font-weight:800; min-width:78px; }
+  .row-sig .tm { color:var(--mut); font-size:12px; }
+  .live { animation:pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+  /* 持仓中 */
+  .pos { background:#1b2230; border:1px solid var(--border); border-radius:10px;
+         padding:9px 12px; margin-bottom:7px; }
+  .pos .t { display:flex; gap:9px; align-items:center; flex-wrap:wrap; font-size:14px; }
+  .pos .t .pnl { margin-left:auto; font-weight:800; font-size:16px; }
+  .pos .bar { height:5px; border-radius:3px; background:#30363d; margin-top:8px; position:relative; }
+  .pos .bar i { position:absolute; top:-3px; width:3px; height:11px; background:var(--gold);
+                border-radius:2px; }
+  /* 分页 */
+  .pager { display:flex; align-items:center; justify-content:center; gap:12px; margin:12px 0 2px; }
+  .pager button { background:var(--card); color:var(--fg); border:1px solid var(--border);
+                  border-radius:8px; padding:8px 16px; font-size:15px; font-weight:700; cursor:pointer; }
+  .pager button:disabled { opacity:.3; cursor:default; }
+  .pager .pg { color:var(--mut); font-size:14px; min-width:96px; text-align:center; }
+  @media (max-width:600px){
     h1{ font-size:19px; }
     .wrap{ padding:10px 9px 22px; }
-    .cards{ grid-template-columns:repeat(3,1fr); }
-    .card .v{ font-size:20px; }
-    .sig .grid{ grid-template-columns:1fr; }
+    .cards{ grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
+    .card{ padding:8px 9px; }
+    .card .v{ font-size:17px; }
+    .card .l{ font-size:11px; }
+    /* 手机上 .tm(时间)被隐藏 → 剩 4 项。原来给"方向/类型/等级"那格只留 62px，
+       内容放不下就换行堆叠成两行。改成让中间那格吃掉剩余空间，其余按内容自适应。 */
+    .row-sig{ grid-template-columns:34px minmax(0,1fr) auto auto; column-gap:7px; row-gap:0; }
+    .row-sig .pnl{ min-width:58px; font-size:13px; }
+    .row-sig .tm{ display:none; }
+    /* 日头：让统计串独占一行并换行，否则最后一项会被挤出右边缘 */
+    .dayhead{ row-gap:3px; }
+    .dayhead .sp{ flex:1 1 100%; margin-left:0; gap:9px; font-size:12px; }
+    .dayhead .dt{ font-size:16px; }
   }
 </style>
 </head>
@@ -254,11 +537,20 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="cards" id="cards"></div>
   <div id="stats" class="muted" style="margin:9px 0 13px"></div>
 
+  <!-- 资金与盈亏（含持仓中实时浮动） -->
+  <section>
+    <h2>💰 资金与盈亏（美元） <span class="muted" id="eqSrc"
+        style="font-weight:400;font-size:13px"></span></h2>
+    <div class="cards" id="eqCards"></div>
+    <div id="posWrap" style="margin-top:10px"></div>
+  </section>
+
   <div class="main">
-    <!-- 左（第一优先）：信号 -->
+    <!-- 左（第一优先）：按日分区 + 分页 -->
     <section>
-      <h2>🔔 最近信号</h2>
-      <div id="sigWrap" class="muted">加载中…</div>
+      <h2>📅 按日分区 · 信号与盈亏</h2>
+      <div id="dailyWrap" class="muted">加载中…</div>
+      <div class="pager" id="pager"></div>
     </section>
 
     <!-- 右：胜率 + 实时状态 -->
@@ -277,21 +569,29 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="foot">
-    数据源 signals.db + dpb_status.json · 每 30 秒自动刷新 · 零 API 消耗
+    数据源 signals.db + dpb_status.json + paxg_stream.db · 每 15 秒自动刷新 · 零 API 消耗
   </div>
 </div>
 
 <script>
 const E = (t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;};
 const fmtN = v => (v==null?'-':v);
+// 每日分区：分页状态必须放在 load() 外面，否则每次自动刷新都会跳回第 1 页
+let dailyPage = 1, dailyPages = 1;
+const DAY_PER_PAGE = 5;
+const usd = v => (Number(v||0)>=0?'+':'') + Number(v||0).toFixed(2);
+const usdAbs = v => Number(v||0).toFixed(2);
+const cls = v => (Number(v||0)>=0 ? 'up' : 'dn');
 
 async function load(){
   try{
-    const [st, sg, sy, oc] = await Promise.all([
+    const [st, sy, oc, eq, dl] = await Promise.all([
       fetch('/api/stats').then(r=>r.json()),
-      fetch('/api/signals?limit=60').then(r=>r.json()),
       fetch('/api/status').then(r=>r.json()),
       fetch('/api/outcomes').then(r=>r.json()).catch(()=>({closed:0})),
+      fetch('/api/equity').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/daily?page='+dailyPage+'&per_page='+DAY_PER_PAGE)
+        .then(r=>r.json()).catch(()=>({days:[],pages:1})),
     ]);
 
     // 顶栏
@@ -378,52 +678,131 @@ async function load(){
     parts.forEach(p=>sd.appendChild(E('div',null,p)));
     sd.appendChild(E('div',null,'配置 — trade_freq='+sy.config.trade_freq+`  trend_stability=${sy.config.trend_stability}  min_grade=${sy.config.min_signal_grade}  共振阈值=${sy.config.resonance_min_count}  突破SL=${sy.config.breakout_sl_atr}×ATR`));
 
-    // 信号卡片列表（移动端友好，不横向滚动）
-    const sw=document.getElementById('sigWrap'); sw.innerHTML='';
-    if(!sg.signals.length){ sw.appendChild(E('div','muted','暂无信号记录')); return; }
-    const num = v => (v==null||v==='')?'-':(typeof v==='number'?v.toFixed(2):v);
-    const OUT = {SL:['❌ 止损','#f85149'], TP1:['✅ 达TP1','#3fb950'],
-                 TP2:['🏆 达TP2','#3fb950'], open:['⏳ 持仓中','#e3b341']};
-    sg.signals.forEach(s=>{
-      const box=E('div','sig');
-      const top=E('div','top');
-      top.appendChild(E('span','tfname', s.timeframe));
-      top.appendChild(E('span', s.direction===1?'dir-long':'dir-short', s.direction===1?'🟢 做多':'🔴 做空'));
-      if(s.sig_type) top.appendChild(E('span','muted', s.sig_type));
-      if(s.grade) top.appendChild(E('span','pill '+s.grade, s.grade+'级 '+((s.score??'')+'/10')));
-      if(s.resonance>=2) top.appendChild(E('span','fire','🔥共振'+s.resonance));
-      // 每条信号直接显示当前结果。注意区分「已结案」与「追踪中」：
-      // TP1 已到但还没到 TP2、窗口也未走满时，单子还在跑，不能算已结案。
-      if(s.outcome){
-        const base = OUT[s.outcome] || [s.outcome,'#9aa7b6'];
-        let txt, col;
-        if(s.outcome==='open'){ txt='⏳ 追踪中'; col='#e3b341'; }
-        else if(!s.resolved_at){ txt='👀 '+base[0]+'·追踪中'; col='#e3b341'; }
-        else { txt=base[0]; col=base[1]; }
-        const rr = (s.r_multiple!=null) ? ` ${s.r_multiple>=0?'+':''}${Number(s.r_multiple).toFixed(2)}R` : '';
-        const bd = E('span',null,txt+rr);
-        bd.style.cssText = `font-weight:800;font-size:13px;color:${col}`;
-        if(!s.resolved_at && s.outcome!=='open') bd.title='TP1 已到但未到 TP2，窗口未走满，仍在追踪';
-        top.appendChild(bd);
-      }
-      top.appendChild(E('span','time', s.pushed_at||''));
-      box.appendChild(top);
-      const g=E('div','grid');
-      const kv=(k,v,cls)=>{const d=E('div','kv');d.appendChild(E('span',null,k));d.appendChild(E('b',cls||null,v));g.appendChild(d);};
-      kv('入场', num(s.entry), 'big');
-      kv('止损', num(s.sl));
-      kv('TP1', num(s.tp1));
-      kv('TP2', num(s.tp2));
-      kv('RSI', s.rsi==null?'-':Number(s.rsi).toFixed(1));
-      kv('ATR', num(s.atr));
-      box.appendChild(g);
-      sw.appendChild(box);
+    // ================= 资金与盈亏 =================
+    const ew = document.getElementById('eqCards'); ew.innerHTML='';
+    document.getElementById('eqSrc').textContent = eq.live_price
+      ? `现价 ${Number(eq.live_price).toFixed(2)}（${eq.live_source||''}）· 每笔 ${eq.oz_per_trade} 盎司=$${eq.oz_per_trade}/美元波动`
+      : '';
+    if(eq.initial_equity!=null){
+      const tot=eq.equity_total, real=eq.realized_usd, un=eq.unrealized_usd;
+      const net=real+un, base=eq.initial_equity;
+      const mk=(l,v,c)=>{const d=E('div','card'+(c?' '+c:''));
+        d.appendChild(E('div','v',v)); d.appendChild(E('div','l',l)); ew.appendChild(d);};
+      mk('初始资金', Number(base).toFixed(0), '');
+      mk('当前权益', Number(tot).toFixed(2), tot>=base?'good':'bad');
+      mk('累计盈亏', usd(net), net>=0?'good':'bad');
+      mk('已实现', usd(real), real>=0?'good':'bad');
+      mk('持仓浮动', usd(un), un>=0?'good':'bad');
+      mk('收益率', (eq.return_pct>=0?'+':'')+Number(eq.return_pct).toFixed(2)+'%',
+         eq.return_pct>=0?'good':'bad');
+      mk('累计R', (eq.realized_r>=0?'+':'')+Number(eq.realized_r).toFixed(2)+'R', '');
+      mk('胜率', eq.win_rate==null?'-':Number(eq.win_rate).toFixed(1)+'%', '');
+      mk('结案/追踪', eq.closed+' / '+eq.tracking, '');
+    }
+
+    // ================= 持仓中（实时浮动） =================
+    const pw = document.getElementById('posWrap'); pw.innerHTML='';
+    const pos = eq.open_positions||[];
+    if(pos.length){
+      const t=E('div','muted','⏳ 持仓中 '+pos.length+' 笔 · 按实时价估算（'+(eq.live_source||'')+'）');
+      t.style.marginBottom='7px'; pw.appendChild(t);
+      pos.forEach(p=>{
+        const box=E('div','pos'), tp=E('div','t');
+        if(p.grade) tp.appendChild(E('span','pill '+p.grade, p.grade));
+        tp.appendChild(E('span',null,p.timeframe));
+        tp.appendChild(E('span', p.direction>0?'dir-long':'dir-short',
+                          p.direction>0?'🟢做多':'🔴做空'));
+        if(p.sig_type) tp.appendChild(E('span','muted',p.sig_type));
+        tp.appendChild(E('span','pnl '+cls(p.float_pnl_usd),
+          usd(p.float_pnl_usd)+' U ('+usd(p.float_r)+'R)'));
+        box.appendChild(tp);
+        const g=E('div','muted');
+        g.style.cssText='font-size:13px;margin-top:3px';
+        g.appendChild(E('span',null,
+          `入 ${Number(p.entry).toFixed(2)} · 损 ${Number(p.sl).toFixed(2)}`
+          + ` · TP1 ${Number(p.tp1).toFixed(2)} · TP2 ${Number(p.tp2).toFixed(2)}`
+          + ` · 风险 ${usdAbs(p.risk_usd)} U · 现价 ${p.live_price?Number(p.live_price).toFixed(2):'-'}`));
+        box.appendChild(g);
+        // 仓位进度条：入场→止损 之间，标出现价位置
+        const lo=Math.min(Number(p.entry),Number(p.sl)), hi=Math.max(Number(p.entry),Number(p.sl));
+        const span=(hi-lo)||1;
+        const bar=E('div','bar');
+        const mark=document.createElement('i');
+        let frac=(Number(p.live_price||p.entry)-lo)/span;
+        frac=Math.max(0,Math.min(1,frac));
+        mark.style.left=(frac*100).toFixed(1)+'%';
+        bar.appendChild(mark); box.appendChild(bar);
+        pw.appendChild(box);
+      });
+    }
+
+    // ================= 按日分区 + 分页 =================
+    dailyPages = dl.pages||1; dailyPage = dl.page||1;
+    const dw=document.getElementById('dailyWrap'); dw.innerHTML='';
+    const dlist = dl.days||[];
+    if(!dlist.length){
+      dw.appendChild(E('div','muted','暂无信号记录'));
+    }
+    dlist.forEach((day, idx)=>{
+      const box=E('div','day');
+      if(idx>0) box.classList.add('collapsed');       // 默认只展开最新一天
+      const h=E('div','dayhead');
+      h.appendChild(E('span','caret', idx>0?'▶':'▼'));
+      h.appendChild(E('span','dt', day.date));
+      const sp=E('span','sp');
+      const bcl=(v)=>'<b class="'+(v>=0?'up':'dn')+'">'+(v>=0?'+':'')+Number(v).toFixed(2)+'</b>';
+      sp.innerHTML = '<span>信号 <b>'+day.n+'</b></span>'
+        + '<span>胜<b class="up">'+day.wins+'</b>/负<b class="dn">'+day.losses+'</b></span>'
+        + '<span>当日 '+bcl(day.day_r)+'R</span>'
+        + '<span>金额 '+bcl(day.day_usd)+'U</span>'
+        + '<span>权益 <b>'+Number(day.equity_end).toFixed(2)+'</b></span>';
+      h.appendChild(sp);
+      h.onclick=()=>{
+        box.classList.toggle('collapsed');
+        const c=h.querySelector('.caret');
+        if(c) c.textContent = box.classList.contains('collapsed')?'▶':'▼';
+      };
+      box.appendChild(h);
+
+      const b=E('div','daybody');
+      const OUT2={SL:['❌止损','dn'], TP1:['✅TP1','up'], TP2:['🏆TP2','up'], open:['⏳持仓','']};
+      (day.signals||[]).slice().reverse().forEach(s=>{
+        const r=E('div','row-sig');
+        r.appendChild(E('span','id','#'+s.id));
+        r.appendChild(E('span','tm', (s.pushed_at||'').slice(11,16)+' '+s.timeframe));
+        const mid=E('span','mid');
+        mid.appendChild(E('span', s.direction>0?'dir-long':'dir-short', s.direction>0?'多':'空'));
+        if(s.sig_type) mid.appendChild(E('span','muted',s.sig_type));
+        if(s.grade) mid.appendChild(E('span','pill '+s.grade, s.grade));
+        r.appendChild(mid);
+        const o=s.outcome||'?';
+        const ot=OUT2[o]||[o,''];
+        let rt=ot[0];
+        if(s.r_multiple!=null) rt+=' '+(s.r_multiple>=0?'+':'')+Number(s.r_multiple).toFixed(2)+'R';
+        const res=E('span','res '+(s.closed?ot[1]:''), rt);
+        if(!s.closed) res.classList.add('live');
+        r.appendChild(res);
+        r.appendChild(E('span','pnl '+cls(s.pnl_usd), usd(s.pnl_usd)));
+        b.appendChild(r);
+      });
+      box.appendChild(b);
+      dw.appendChild(box);
     });
+
+    // 分页控件
+    const pg=document.getElementById('pager'); pg.innerHTML='';
+    const mkBtn=(txt,dis,fn)=>{
+      const btn=document.createElement('button');
+      btn.textContent=txt; btn.disabled=dis; btn.onclick=fn; pg.appendChild(btn);
+    };
+    mkBtn('‹ 上一页', dailyPage<=1, ()=>{ if(dailyPage>1){ dailyPage--; load(); } });
+    pg.appendChild(E('span','pg', '第 '+dailyPage+' / '+dailyPages+' 页'));
+    mkBtn('下一页 ›', dailyPage>=dailyPages, ()=>{ if(dailyPage<dailyPages){ dailyPage++; load(); } });
   }catch(e){
     document.getElementById('sub').textContent='加载失败: '+e;
   }
 }
-load(); setInterval(load, 30000);
+load(); setInterval(load, 15000);   // 15 秒刷新：持仓浮动跟着实时价走
 </script>
 </body>
 </html>
