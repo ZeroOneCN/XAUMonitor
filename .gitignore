@@ -42,3 +42,6 @@ dpb_config.json.*
 
 # 仪表盘预览图（仅本地，用于汇报）
 dashboard_preview.png
+
+# 汇报用预览图（仅本地）
+final_preview.png
