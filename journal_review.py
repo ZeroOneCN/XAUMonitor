@@ -138,11 +138,62 @@ def report(rows, with_market=False):
     print(f"  最差单日 {worst[0]} {worst[1]:+.2f}   最大回撤 {mdd:.2f}")
     print(f"  亏损天数 {sum(1 for d in ds if byday[d] < 0)}/{len(ds)}")
 
+    hr("⑨ 过路费核算（点差 / 佣金）")
+    cost_analysis(rows)
+
     if with_market:
         try:
             market_mae(rows)
         except Exception as e:
             print(f"\n  （行情分析失败: {e}）")
+
+
+def cost_analysis(rows):
+    """过路费核算 —— 实测经纪商点差（同一分钟内一多一空的开仓价差），
+    据此估算总成本。这一步常常是「为什么胜率高却亏钱」的真答案。"""
+    import datetime as dt
+    from collections import defaultdict
+    for r in rows:
+        try:
+            r["_t"] = dt.datetime.fromisoformat(r["open_time"])
+        except Exception:
+            r["_t"] = None
+    bysym = defaultdict(list)
+    for r in rows:
+        if r["_t"] and r.get("symbol", "").startswith("XAUUSD"):
+            bysym[r["symbol"]].append(r)
+    spreads = []
+    for sym, g in bysym.items():
+        g.sort(key=lambda x: x["_t"])
+        sp = []
+        for i in range(len(g) - 1):
+            a, b = g[i], g[i + 1]
+            if ((b["_t"] - a["_t"]).total_seconds() <= 60
+                    and a["order_type"] != b["order_type"]
+                    and a["lot_size"] == b["lot_size"]):
+                d = b["open_price"] - a["open_price"]
+                if a["order_type"] == "sell":
+                    d = -d          # 卖价 − 买价（负值），取绝对值即点差
+                sp.append(abs(d))
+        if len(sp) >= 15:
+            print(f"    {sym:<12}配对 {len(sp):>4} 组   点差中位 {st.median(sp):.2f}")
+        spreads += sp
+    if not spreads:
+        print("    （配对样本不足，无法实测点差）")
+        return
+    sp = st.median(spreads)
+    n = len(rows)
+    comm = sum(r["commission"] for r in rows)
+    tot_sp = sum(r["lot_size"] * 100 * sp for r in rows)
+    net = sum(r["net"] for r in rows)
+    print(f"\n    实测点差中位 {sp:.2f} 美元/盎司（{len(spreads)} 组配对）")
+    print(f"    点差成本 ≈ -{tot_sp:.2f}   佣金 {comm:+.2f}   合计过路费 "
+          f"≈ -{tot_sp + abs(comm):.2f}")
+    print(f"    平均每笔 {(tot_sp + abs(comm)) / n:.3f}   （净盈亏 {net:+.2f}）")
+    print(f"    ⇒ 过路费占净亏损 {abs(tot_sp + abs(comm)) / abs(net) * 100:.0f}%"
+          if net else "")
+    print("    注意：点差已包含在你的开/平仓价里（开仓取买价、平仓取卖价），"
+          "所以\n    毛盈亏本身已扣过一次点差；此处是把它单独拎出来看清成本量级。")
 
 
 def market_mae(rows):
