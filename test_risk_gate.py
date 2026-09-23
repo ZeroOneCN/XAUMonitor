@@ -41,7 +41,15 @@ def build(rows, ts=None):
     c.close()
 
 
-CFG = {"db_file": TMP, "account_equity": 650, "risk_per_trade_pct": 1.0}
+CFG = {"db_file": TMP, "account_equity": 650, "risk_per_trade_pct": 1.0,
+       "risk_gate": {"max_open_positions": 3}}   # 显式给笔数上限，用于测「粗代理」那道门
+
+# 默认档：不设任何持仓限制（用户决定 —— 按仓位管，不按笔数管）
+CFG_UNLIM = {"db_file": TMP, "account_equity": 650, "risk_per_trade_pct": 1.0}
+
+# 敞口档：用「总敞口」表达同一个意思（正解口径）
+CFG_RISK = {"db_file": TMP, "account_equity": 650, "risk_per_trade_pct": 1.0,
+            "risk_gate": {"max_total_risk_pct": 3.0}}
 
 print("=" * 76)
 print("① 无记录 → 应放行")
@@ -87,7 +95,7 @@ r = m.risk_gate(CFG)
 print(f"  allowed={r['allowed']}  持仓={r['detail']['open_positions']}")
 for x in r["reasons"]:
     print(f"    ⛔ {x}")
-ok4 = r["allowed"] is False and any("持仓已满" in x for x in r["reasons"])
+ok4 = r["allowed"] is False and any("持仓达上限" in x for x in r["reasons"])
 print(f"  {'✅ 通过' if ok4 else '❌ 失败'}")
 
 print()
@@ -172,9 +180,59 @@ for x in r["reasons"]:
 ok11 = r["allowed"] is False and r["detail"]["open_positions"] == 3
 print(f"  {'✅ 通过' if ok11 else '❌ 失败'}")
 
+print()
+print("=" * 76)
+print("⑫ 默认不限制持仓笔数：8 笔未结案也应放行（用户决定）")
+print("=" * 76)
+build([(i, None, None) for i in range(1, 9)])
+r = m.risk_gate(CFG_UNLIM)
+print(f"  allowed={r['allowed']}  活持仓={r['detail']['open_positions']}  "
+      f"总敞口={r['detail']['total_risk_pct']:.1f}%")
+print(f"  reasons={r['reasons']}")
+ok12 = r["allowed"] is True and r["detail"]["open_positions"] == 8
+print(f"  {'✅ 通过' if ok12 else '❌ 失败'}")
+
+print()
+print("=" * 76)
+print("⑬ 用「总敞口」管：上限 3%，已有 2 笔(2%) → 再开 1 笔将达 3% 应放行")
+print("=" * 76)
+build([(1, None, None), (2, None, None)])
+r = m.risk_gate(CFG_RISK)
+print(f"  allowed={r['allowed']}  在场 {r['detail']['total_risk_pct']:.1f}%  "
+      f"上限 {r['detail'].get('max_total_risk_pct')}%")
+ok13 = r["allowed"] is True
+print(f"  {'✅ 通过' if ok13 else '❌ 失败'}")
+
+print()
+print("=" * 76)
+print("⑭ 用「总敞口」管：已有 3 笔(3%) → 再开 1 笔将达 4% > 上限 3% 应拦住")
+print("=" * 76)
+build([(1, None, None), (2, None, None), (3, None, None)])
+r = m.risk_gate(CFG_RISK)
+print(f"  allowed={r['allowed']}  在场 {r['detail']['total_risk_pct']:.1f}%")
+for x in r["reasons"]:
+    print(f"    ⛔ {x}")
+ok14 = r["allowed"] is False and any("总敞口超限" in x for x in r["reasons"])
+print(f"  {'✅ 通过' if ok14 else '❌ 失败'}")
+
+print()
+print("=" * 76)
+print("⑮ 敞口口径能反映「手数被改大」：单笔风险 1% → 3%，2 笔就超 3% 上限")
+print("=" * 76)
+build([(1, None, None), (2, None, None)])
+cfg_big = dict(CFG_RISK, risk_per_trade_pct=3.0)
+r = m.risk_gate(cfg_big)
+print(f"  allowed={r['allowed']}  在场 {r['detail']['total_risk_pct']:.1f}% "
+      f"（2 笔 × 3%）")
+for x in r["reasons"]:
+    print(f"    ⛔ {x}")
+ok15 = r["allowed"] is False
+print(f"  {'✅ 通过（这正是笔数口径算不出来的场景）' if ok15 else '❌ 失败'}")
+
 if os.path.exists(TMP):
     os.remove(TMP)
-res = [ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8, ok9, ok10, ok11]
+res = [ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8, ok9, ok10, ok11,
+       ok12, ok13, ok14, ok15]
 print()
 print("=" * 76)
 print(f"总判定: {'✅ 全部 ' + str(len(res)) + ' 项通过' if all(res) else '❌ 失败项: ' + str([i+1 for i,v in enumerate(res) if not v])}")

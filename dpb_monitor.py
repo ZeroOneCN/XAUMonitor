@@ -1863,7 +1863,13 @@ def outcome_stats(db_file: str) -> dict:
 _RISK_GATE_DEFAULTS = {
     "enabled": True,
     "daily_loss_limit_pct": 3.0,    # 单日已实现亏损 ≥ 账户 X% → 当日不再开新仓
-    "max_open_positions": 3,        # 同时最多持有 N 笔
+    # 持仓管理：正确的控制变量是「总敞口」，不是「笔数」。
+    # max_open_positions 是粗代理 —— 按用户决定**默认 0 = 不限制**。
+    # 想设上限时，用 max_total_risk_pct 表达（那是正解）。
+    # 注：本系统仓位计算器固定按 risk_per_trade_pct 出量，所以每笔风险≈1%，
+    #     两个口径在数学上等价；差别在于你手动改了手数时，只有敞口口径还算得对。
+    "max_open_positions": 0,        # 0 = 不限制持仓笔数
+    "max_total_risk_pct": 0.0,      # 0 = 不限制；同时在场风险之和占账户的上限
     "cooldown_after_losses": 3,     # 连续亏损 N 笔
     "cooldown_hours": 4,            # → 强制冷静 M 小时
 }
@@ -1943,10 +1949,25 @@ def risk_gate(cfg: dict, db_file: str = None, now=None) -> dict:
             reasons.append(f"单日亏损熔断：今日已实现 {today_usd:+.2f} 美元"
                            f"（{today_r:+.2f}R），已达限额 -{limit_usd:.2f}")
 
-    # ② 最大同时持仓
-    max_open = int(g.get("max_open_positions", 3) or 0)
+    # ② 持仓管理 —— 按「总敞口」管，不按「笔数」管。
+    #   粗代理（笔数）默认关闭；敞口口径才是正解：同时在场风险之和 ÷ 账户。
+    #   两者在本系统里数值等价（仓位计算器固定按 risk_per_trade_pct 出量），
+    #   但只有敞口口径能反映「你手动改大了手数」这件事。
+    max_open = int(g.get("max_open_positions", 0) or 0)
     if max_open > 0 and open_n >= max_open:
-        reasons.append(f"持仓已满：当前 {open_n} 笔未结案，上限 {max_open} 笔")
+        reasons.append(f"持仓达上限：当前 {open_n} 笔未结案，上限 {max_open} 笔")
+
+    max_risk_pct = float(g.get("max_total_risk_pct", 0) or 0)
+    per_pct = float(cfg.get("risk_per_trade_pct", 1.0) or 0)
+    detail["risk_per_trade_pct"] = per_pct
+    total_risk_pct = open_n * per_pct
+    detail["total_risk_pct"] = total_risk_pct
+    if max_risk_pct > 0 and eq > 0:
+        detail["max_total_risk_pct"] = max_risk_pct
+        if total_risk_pct + per_pct > max_risk_pct + 1e-9:
+            reasons.append(
+                f"总敞口超限：在场 {open_n} 笔 × {per_pct:g}% = {total_risk_pct:g}%，"
+                f"再开 1 笔将达 {total_risk_pct + per_pct:g}%（上限 {max_risk_pct:g}%）")
 
     # ③ 连亏冷静期：最近 N 笔全亏 → 自最后一笔结案起冷静 M 小时
     n_cool = int(g.get("cooldown_after_losses", 3) or 0)
