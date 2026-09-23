@@ -65,9 +65,12 @@ def report(rows, with_market=False):
     print(f"  笔数 {N}   净盈亏 {net:+.2f}   胜率 {len(wins)/N*100:.1f}%")
     print(f"  均盈 {aw:+.2f}   均亏 {-al:+.2f}   盈亏比 {aw/al if al else 0:.3f}"
           f"   盈亏因子 {sum(r['net'] for r in wins)/abs(sum(r['net'] for r in loss)) if loss else 0:.3f}")
-    be = (1 - len(wins) / N) / (len(wins) / N) * aw
-    print(f"  → 以当前胜率，均亏压到 ${be:.2f} 即可打平（现在 ${al:.2f}，"
-          f"需改善 {(al-be)/al*100:.0f}%）")
+    # 打平条件: p×均盈 = (1-p)×均亏  →  均亏 = p/(1-p) × 均盈
+    # （第一版把分子分母写反，算出 $0.86 这种荒谬值，已修正）
+    wr = len(wins) / N
+    be = wr / (1 - wr) * aw
+    print(f"  → 以当前胜率 {wr*100:.1f}%，均亏压到 ${be:.2f} 即打平"
+          f"（现在 ${al:.2f}，只需改善 {(al-be)/al*100:.0f}%）")
 
     hr("② 亏损集中度")
     ls = sorted(r["net"] for r in loss)
