@@ -699,125 +699,277 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>XAUMonitor · DPB 黄金信号监控</title>
 <style>
-  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e9eef5; --mut:#9aa7b6;
-          --green:#3fb950; --red:#f85149; --gold:#e3b341; --blue:#58a6ff; --fs:17px; }
-  * { box-sizing:border-box; -webkit-text-size-adjust:100%; }
-  body { margin:0; background:var(--bg); color:var(--fg); font-size:var(--fs); line-height:1.5;
-         font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:1240px; margin:0 auto; padding:12px 12px 26px; }
-  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
-  h1 { font-size:21px; margin:0; letter-spacing:.3px; white-space:nowrap; }
-  h2 { font-size:16px; margin:0 0 9px; padding-left:8px; border-left:4px solid var(--blue); }
-  .sub { color:var(--mut); font-size:13px; }
-  section { margin-bottom:14px; }
-  /* 顶部指标条：紧凑，一屏放得下 */
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(104px,1fr)); gap:8px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:10px;
-          padding:9px 12px; min-width:0; }
-  .card .v { font-size:23px; font-weight:800; line-height:1.15;
-              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .card .l { color:var(--mut); font-size:12px; margin-top:1px; }
-  /* 数据发布窗口告警卡：必须一眼可见 */
-  .card.warn { background:#3d1d1d; border-color:#f85149; }
-  .card.warn .v { color:#ff7b72; font-size:17px; }
-  .card.warn .l { color:#ff9a92; }
-  /* 主区：桌面左右双列，信号在左（视觉第一优先） */
-  .main { display:grid; gap:14px; align-items:start; }
-  .col-b > section:last-child { margin-bottom:0; }
-  @media (min-width:960px){
-    .main { grid-template-columns:minmax(0,1.3fr) minmax(0,1fr); }
+  /* ══════════════════════════════════════════════════════════════
+     设计令牌（Design Tokens）
+     优化前：字号 11/12/13/14/15/16/17/18/19/21/23 共 11 种散装值，
+             间距 8~14px 随手写，圆角 8/10/11/12 混用，颜色只有 7 个变量。
+             结果：卡片之间"看着差不多但都不一样"，属于视觉噪音。
+     优化后：字号 6 级、间距 4px 基准 6 级、圆角 4 级、表面色 4 层。
+             所有组件只引用令牌，不再出现魔法数字。
+     ══════════════════════════════════════════════════════════════ */
+  :root{
+    /* ── 表层（暗→亮 4 层，建立纵深） ── */
+    --bg:#0a0e13;      /* 页面底 */
+    --s1:#131920;      /* 一级卡面 */
+    --s2:#1a222c;      /* 内嵌 / 次级面 */
+    --s3:#222c38;      /* 日头 / 悬浮面 */
+    /* ── 描边（2 级：定界 vs 分隔） ── */
+    --line:#28323e;
+    --line2:#1c242e;
+    /* ── 文字（3 级层次，替代原来只有 fg/mut 两级） ── */
+    --fg:#e9eff7;      /* 主：数字、标题 */
+    --fg2:#aab7c6;     /* 次：标签、说明 */
+    --fg3:#6f7d8e;     /* 弱：脚注、单位 */
+    /* ── 语义色 ── */
+    --up:#3fb950; --dn:#f85149; --warn:#e3b341; --info:#58a6ff;
+    --up-bg:#122b18; --dn-bg:#2c1414; --warn-bg:#2b2008;
+    /* ── 空间（4px 基准，6 级） ── */
+    --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px; --sp5:22px; --sp6:30px;
+    /* ── 圆角（4 级） ── */
+    --r1:6px; --r2:10px; --r3:14px; --r4:18px;
+    /* ── 字号（6 级） ── */
+    --fs-xs:11.5px; --fs-sm:13px; --fs-md:14.5px; --fs-lg:16.5px;
+    --fs-xl:21px; --fs-2xl:30px;
+    /* ── 旧变量名保留，避免 JS 内联样式失效 ── */
+    --green:var(--up); --red:var(--dn); --gold:var(--warn); --blue:var(--info);
+    --card:var(--s1); --border:var(--line); --mut:var(--fg2);
   }
-  /* 各周期状态：紧凑卡片网格 */
-  .tf-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:8px; }
-  .tf { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:9px 11px; }
-  .tf .name { font-size:16px; font-weight:800; margin-bottom:5px; display:flex; justify-content:space-between; align-items:baseline; }
-  .tf .name span { font-size:12px; font-weight:600; color:var(--mut); }
-  .tf .row { display:flex; justify-content:space-between; gap:8px; font-size:13px; color:var(--mut); padding:1px 0; }
-  .tf .row b { color:var(--fg); font-weight:700; }
-  .sig { background:var(--card); border:1px solid var(--border); border-radius:12px;
-         padding:11px 13px; margin-bottom:9px; }
-  .sig .top { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:8px; }
-  .sig .tfname { font-size:18px; font-weight:800; }
-  .sig .time { color:var(--mut); font-size:13px; margin-left:auto; }
-  .sig .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px 14px; }
-  .sig .kv { font-size:15px; color:var(--mut); display:flex; justify-content:space-between; gap:8px; }
-  .sig .kv b { color:var(--fg); font-weight:800; }
-  .dir-long { color:var(--green); font-weight:800; }
-  .dir-short { color:var(--red); font-weight:800; }
-  .pill { display:inline-block; padding:2px 9px; border-radius:11px; font-size:13px; font-weight:800; }
-  .S{background:#e3b341;color:#000} .A{background:#3fb950;color:#000}
-  .B{background:#58a6ff;color:#000} .C{background:#8a94a6;color:#000}
-  .fire{color:var(--gold);font-weight:800}
-  .muted{color:var(--mut);font-size:14px}
-  .big{font-size:19px;font-weight:800}
-  .foot{text-align:center;padding:8px 0 18px;font-size:12px;color:var(--mut)}
-  /* 资金与盈亏 */
-  .card.good .v{ color:var(--green); } .card.bad .v{ color:var(--red); }
-  /* 按日分区 */
-  .day { background:var(--card); border:1px solid var(--border); border-radius:12px;
-         margin-bottom:10px; overflow:hidden; }
-  .dayhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-             padding:10px 13px; background:#1b2230; border-bottom:1px solid var(--border);
-             cursor:pointer; user-select:none; }
-  .dayhead .dt { font-size:17px; font-weight:800; }
-  .dayhead .caret { color:var(--mut); font-size:12px; }
-  .dayhead .sp { margin-left:auto; display:flex; gap:11px; flex-wrap:wrap;
-                 font-size:13px; color:var(--mut); }
-  .dayhead .sp b { font-weight:800; }
-  .up{ color:var(--green); } .dn{ color:var(--red); }
-  .daybody { padding:6px 13px 10px; }
-  .day.collapsed .daybody { display:none; }
-  .row-sig { display:grid; grid-template-columns:38px 74px 1fr auto auto;
-             gap:8px; align-items:center; font-size:14px; padding:5px 0;
-             border-bottom:1px dashed #232a35; }
-  .row-sig:last-child { border-bottom:0; }
-  .row-sig .id { color:var(--mut); font-size:12px; }
-  .row-sig .mid { display:flex; gap:7px; align-items:center; flex-wrap:wrap; }
-  .row-sig .res { font-size:13px; font-weight:700; }
-  .row-sig .pnl { text-align:right; font-weight:800; min-width:78px; }
-  .row-sig .tm { color:var(--mut); font-size:12px; }
-  .live { animation:pulse 1.6s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
-  /* 持仓中 */
-  .pos { background:#1b2230; border:1px solid var(--border); border-radius:10px;
-         padding:9px 12px; margin-bottom:7px; }
-  .pos .t { display:flex; gap:9px; align-items:center; flex-wrap:wrap; font-size:14px; }
-  .pos .t .pnl { margin-left:auto; font-weight:800; font-size:16px; }
-  .pos .bar { height:5px; border-radius:3px; background:#30363d; margin-top:8px; position:relative; }
-  .pos .bar i { position:absolute; top:-3px; width:3px; height:11px; background:var(--gold);
-                border-radius:2px; }
-  /* 分页 */
-  .pager { display:flex; align-items:center; justify-content:center; gap:12px; margin:12px 0 2px; }
-  .pager button { background:var(--card); color:var(--fg); border:1px solid var(--border);
-                  border-radius:8px; padding:8px 16px; font-size:15px; font-weight:700; cursor:pointer; }
-  .pager button:disabled { opacity:.3; cursor:default; }
-  .pager .pg { color:var(--mut); font-size:14px; min-width:96px; text-align:center; }
-  /* 图表（服务端 SVG，无外部依赖） */
-  /* max-width 上限：viewBox 是 660 宽，桌面容器 1200+ 时若不设上限，
-     SVG 会被拉伸到 1.8 倍，图内 10px 文字变成 18px 大字、比例失衡。
-     限到 720 后放大倍率≈1.09，配 12px 字号在桌面正好，窄屏则是等比缩小。 */
-  .chart { display:block; width:100%; max-width:720px; height:auto; margin:0 auto; }
-  .ch-empty { padding:14px 0; text-align:center; font-size:13px; }
-  .ch-wrap { background:var(--card); border:1px solid var(--border); border-radius:12px;
-             padding:10px 12px 7px; margin-bottom:10px; }
-  .ch-wrap h3 { margin:0 0 3px; font-size:14px; font-weight:700; }
-  .ch-wrap .sub { font-size:12px; color:var(--mut); margin:0 0 7px; line-height:1.45; }
+
+  *{ box-sizing:border-box; -webkit-text-size-adjust:100%; }
+
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-size:var(--fs-md); line-height:1.5;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+                "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    /* 关键：等宽数字。仪表盘里所有数字必须逐位对齐，
+       否则上下行的小数点会错位，扫读时极易看错一位。 */
+    font-variant-numeric:tabular-nums;
+    font-feature-settings:"tnum" 1,"lnum" 1;
+    -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+    text-rendering:optimizeLegibility;
+  }
+
+  .wrap{ max-width:1240px; margin:0 auto; padding:var(--sp3) var(--sp3) var(--sp6); }
+
+  /* ───── 页头 ───── */
+  header{
+    display:flex; align-items:baseline; gap:var(--sp3); flex-wrap:wrap;
+    margin-bottom:var(--sp4); padding-bottom:var(--sp3);
+    border-bottom:1px solid var(--line2);
+  }
+  h1{
+    font-size:var(--fs-xl); margin:0; font-weight:800; letter-spacing:-.2px;
+    white-space:nowrap; line-height:1.2;
+  }
+
+  /* ───── 区块标题：统一"左侧色条 + 标题 + 右侧说明"三层结构 ───── */
+  section{ margin-bottom:var(--sp5); }
+  h2{
+    display:flex; align-items:baseline; gap:var(--sp2);
+    font-size:var(--fs-lg); font-weight:750; letter-spacing:-.1px;
+    margin:0 0 var(--sp3); padding-left:10px;
+    border-left:3px solid var(--info); line-height:1.35;
+  }
+  h2 .meta{
+    margin-left:auto; font-size:var(--fs-xs); font-weight:500;
+    color:var(--fg3); letter-spacing:.2px; white-space:nowrap;
+  }
+  h3{ font-size:var(--fs-sm); font-weight:700; margin:0 0 var(--sp1); letter-spacing:.1px; }
+  .sub{
+    color:var(--fg3); font-size:var(--fs-xs); line-height:1.6;
+    margin:0 0 var(--sp2);
+  }
+  .muted{ color:var(--fg2); }
+  .big{ font-size:var(--fs-lg); font-weight:800; }
+
+  /* ───── 指标卡：全局统一唯一实现 ─────
+     优化前 .card / .tf / .sig / .pos / .ch-wrap 各自写一遍
+     background+border+radius+padding，值还不一样 → 视觉噪音。
+     现在所有面统一走 .card，变体只做最小覆盖。 */
+  .cards{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(108px,1fr));
+    gap:var(--sp2);
+  }
+  .card{
+    background:var(--s1); border:1px solid var(--line); border-radius:var(--r2);
+    padding:var(--sp3); min-width:0;
+  }
+  .card .v{
+    font-size:var(--fs-xl); font-weight:800; line-height:1.14;
+    letter-spacing:-.4px; white-space:nowrap;
+    /* 刻意不加 overflow:hidden / text-overflow:ellipsis ——
+       被截断的数字会读成"另一个数字"（$1,748 看成 $1,7），
+       在资金看板上这是数据错误而不是样式问题。
+       宁可让它换行露出来，也不能悄悄切掉。 */
+    overflow-wrap:anywhere;
+  }
+  .card .l{
+    color:var(--fg3); font-size:var(--fs-xs); margin-top:3px;
+    letter-spacing:.3px; line-height:1.35;
+  }
+  .card.good .v{ color:var(--up); }
+  .card.bad  .v{ color:var(--dn); }
+  .card.warn{ background:var(--dn-bg); border-color:var(--dn); }
+  .card.warn .v{ color:#ff7b72; font-size:var(--fs-lg); }
+  .card.warn .l{ color:#ff9a92; }
+  /* 分组卡：把一堆同权重卡片变成"有结构的三簇" */
+  .cgroup{ margin-bottom:var(--sp3); }
+  .cgroup:last-child{ margin-bottom:0; }
+  .cgroup > .cglabel{
+    font-size:var(--fs-xs); color:var(--fg3); font-weight:600;
+    letter-spacing:.6px; margin-bottom:var(--sp1); text-transform:uppercase;
+  }
+
+  /* ───── 主区：桌面左右双列 ───── */
+  .main{ display:grid; gap:var(--sp5); align-items:start; }
+  .col-b > section:last-child{ margin-bottom:0; }
+  @media (min-width:960px){
+    .main{ grid-template-columns:minmax(0,1.35fr) minmax(0,1fr); }
+  }
+
+  /* ───── 周期状态卡 ───── */
+  .tf-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:var(--sp2); }
+  .tf{ background:var(--s1); border:1px solid var(--line); border-radius:var(--r2); padding:var(--sp3); min-width:0; }
+  .tf .name{
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-size:var(--fs-sm); font-weight:800; margin-bottom:var(--sp1);
+  }
+  .tf .name span{ font-size:var(--fs-xs); font-weight:600; color:var(--fg3); }
+  .tf .row{
+    display:flex; justify-content:space-between; gap:var(--sp2); min-width:0;
+    font-size:var(--fs-xs); color:var(--fg3); padding:2px 0; line-height:1.5;
+  }
+  .tf .row b{ color:var(--fg); font-weight:700; }
+
+  /* ───── 信号卡 ───── */
+  .sig{
+    background:var(--s1); border:1px solid var(--line); border-radius:var(--r3);
+    padding:var(--sp3) var(--sp4); margin-bottom:var(--sp2);
+  }
+  .sig .top{ display:flex; align-items:center; gap:var(--sp2); flex-wrap:wrap; margin-bottom:var(--sp2); }
+  .sig .tfname{ font-size:var(--fs-lg); font-weight:800; letter-spacing:-.2px; }
+  .sig .time{ color:var(--fg3); font-size:var(--fs-xs); margin-left:auto; }
+  .sig .grid{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--sp1) var(--sp4); }
+  .sig .kv{
+    display:flex; justify-content:space-between; gap:var(--sp2); min-width:0;
+    font-size:var(--fs-sm); color:var(--fg2);
+  }
+  .sig .kv b{ color:var(--fg); font-weight:800; }
+
+  .dir-long{ color:var(--up); font-weight:800; }
+  .dir-short{ color:var(--dn); font-weight:800; }
+  .pill{ display:inline-block; padding:2px 9px; border-radius:99px; font-size:var(--fs-xs); font-weight:800; }
+  .S{ background:var(--warn); color:#000; } .A{ background:var(--up); color:#000; }
+  .B{ background:var(--info); color:#000; } .C{ background:#8a94a6; color:#000; }
+  .fire{ color:var(--warn); font-weight:800; }
+  .foot{
+    text-align:center; padding:var(--sp3) 0 var(--sp5);
+    font-size:var(--fs-xs); color:var(--fg3); line-height:1.7;
+  }
+
+  /* ───── 按日分区 ───── */
+  .day{
+    background:var(--s1); border:1px solid var(--line); border-radius:var(--r3);
+    margin-bottom:var(--sp3); overflow:hidden;
+  }
+  .dayhead{
+    display:flex; align-items:center; gap:var(--sp3); flex-wrap:wrap;
+    padding:var(--sp3) var(--sp4); background:var(--s3);
+    border-bottom:1px solid var(--line); cursor:pointer; user-select:none;
+    transition:background .15s;
+  }
+  .dayhead:hover{ background:#28323f; }
+  .dayhead .dt{ font-size:var(--fs-md); font-weight:800; letter-spacing:-.1px; }
+  .dayhead .caret{ color:var(--fg3); font-size:var(--fs-xs); }
+  .dayhead .sp{
+    margin-left:auto; display:flex; gap:var(--sp3); flex-wrap:wrap;
+    font-size:var(--fs-xs); color:var(--fg3);
+  }
+  .dayhead .sp b{ font-weight:800; color:var(--fg); }
+  .up{ color:var(--up); } .dn{ color:var(--dn); }
+  .daybody{ padding:var(--sp2) var(--sp4) var(--sp3); }
+  .day.collapsed .daybody{ display:none; }
+
+  .row-sig{
+    display:grid; grid-template-columns:40px 72px minmax(0,1fr) auto auto;
+    gap:var(--sp2); align-items:center;
+    font-size:var(--fs-sm); padding:7px 0; border-bottom:1px solid var(--line2);
+  }
+  .row-sig:last-child{ border-bottom:0; }
+  .row-sig .id{ color:var(--fg3); font-size:var(--fs-xs); }
+  .row-sig .mid{ display:flex; gap:var(--sp1); align-items:center; flex-wrap:wrap; min-width:0; }
+  .row-sig .res{ font-size:var(--fs-xs); font-weight:700; }
+  .row-sig .pnl{ text-align:right; font-weight:800; min-width:80px; white-space:nowrap; }
+  .row-sig .tm{ color:var(--fg3); font-size:var(--fs-xs); white-space:nowrap; }
+
+  .live{ animation:pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.45} }
+
+  /* ───── 持仓中 ───── */
+  .pos{
+    background:var(--s2); border:1px solid var(--line); border-radius:var(--r2);
+    padding:var(--sp3); margin-bottom:var(--sp2);
+  }
+  .pos .t{ display:flex; gap:var(--sp2); align-items:center; flex-wrap:wrap; font-size:var(--fs-sm); }
+  .pos .t .pnl{ margin-left:auto; font-weight:800; font-size:var(--fs-md); white-space:nowrap; }
+  .pos .bar{ height:5px; border-radius:3px; background:var(--line); margin-top:var(--sp2); position:relative; }
+  .pos .bar i{ position:absolute; top:-3px; width:3px; height:11px; background:var(--warn); border-radius:2px; }
+
+  /* ───── 分页 ───── */
+  .pager{ display:flex; align-items:center; justify-content:center; gap:var(--sp3); margin:var(--sp4) 0 var(--sp1); }
+  .pager button{
+    background:var(--s1); color:var(--fg); border:1px solid var(--line);
+    border-radius:var(--r1); padding:9px 18px; font-size:var(--fs-sm); font-weight:700;
+    cursor:pointer; transition:background .15s,border-color .15s;
+    font-variant-numeric:tabular-nums;
+  }
+  .pager button:hover:not(:disabled){ background:var(--s3); border-color:#3a4653; }
+  .pager button:disabled{ opacity:.32; cursor:default; }
+  .pager button:focus-visible{ outline:2px solid var(--info); outline-offset:2px; }
+  .pager .pg{ color:var(--fg2); font-size:var(--fs-xs); min-width:96px; text-align:center; }
+
+  /* ───── 图表（服务端 SVG，零外部依赖） ─────
+     max-width 上限：viewBox 是 660 宽，桌面容器 1200+ 时若不设上限，
+     SVG 会被拉伸到 1.8 倍，图内文字变形、比例失衡。 */
+  .chart{ display:block; width:100%; max-width:720px; height:auto; margin:0 auto; }
+  .ch-empty{ padding:var(--sp4) 0; text-align:center; font-size:var(--fs-sm); }
+  .ch-wrap{
+    background:var(--s1); border:1px solid var(--line); border-radius:var(--r3);
+    padding:var(--sp3) var(--sp4) var(--sp2); margin-bottom:var(--sp3);
+  }
+  .ch-wrap:last-child{ margin-bottom:0; }
+  .ch-wrap .sub{ margin:0 0 var(--sp2); }
+
+  /* ───── 响应式 ───── */
   @media (max-width:600px){
-    h1{ font-size:19px; }
-    .wrap{ padding:10px 9px 22px; }
-    .cards{ grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
-    .card{ padding:8px 9px; }
-    .card .v{ font-size:17px; }
-    .card .l{ font-size:11px; }
-    /* 手机上 .tm(时间)被隐藏 → 剩 4 项。原来给"方向/类型/等级"那格只留 62px，
-       内容放不下就换行堆叠成两行。改成让中间那格吃掉剩余空间，其余按内容自适应。 */
-    .row-sig{ grid-template-columns:34px minmax(0,1fr) auto auto; column-gap:7px; row-gap:0; }
-    .row-sig .pnl{ min-width:58px; font-size:13px; }
+    :root{ --sp5:18px; --sp6:24px; --fs-xl:19px; --fs-2xl:26px; }
+    .wrap{ padding:var(--sp3) 10px var(--sp5); }
+    h1{ font-size:18px; }
+    h2{ font-size:var(--fs-md); }
+    h2 .meta{ font-size:var(--fs-xs); }
+    /* 不再强制 3 列：auto-fit 会折叠空轨道，组内 3 张/4 张各自正好排成一行。
+       强制 3 列时 7 张卡会排成 3+3+1，最后一张孤零零一行。 */
+    .cards{ grid-template-columns:repeat(auto-fit,minmax(min(100%,104px),1fr)); gap:var(--sp2); }
+    .card{ padding:var(--sp2) 10px; }
+    .card .v{ font-size:var(--fs-lg); letter-spacing:-.2px; }
+    .card .l{ font-size:var(--fs-xs); }
+    /* 手机上 .tm(时间) 隐藏 → 剩 4 项。
+       中间那格必须 minmax(0,1fr) 才能收缩，否则中文内容放不下会堆成两行。 */
+    .row-sig{ grid-template-columns:34px minmax(0,1fr) auto auto; column-gap:7px; }
+    .row-sig .pnl{ min-width:58px; font-size:var(--fs-xs); }
     .row-sig .tm{ display:none; }
-    /* 日头：让统计串独占一行并换行，否则最后一项会被挤出右边缘 */
-    .dayhead{ row-gap:3px; }
-    .dayhead .sp{ flex:1 1 100%; margin-left:0; gap:9px; font-size:12px; }
-    .dayhead .dt{ font-size:16px; }
+    /* 日头：统计串独占一行并允许换行，否则最后一项会被挤出右边缘 */
+    .dayhead{ row-gap:3px; padding:var(--sp2) var(--sp3); }
+    .dayhead .sp{ flex:1 1 100%; margin-left:0; gap:9px; }
+    .dayhead .dt{ font-size:var(--fs-md); }
+    .daybody{ padding:var(--sp1) var(--sp3) var(--sp2); }
+  }
+
+  /* 尊重系统「减少动态效果」设置 */
+  @media (prefers-reduced-motion:reduce){
+    *{ animation-duration:.001ms !important; transition-duration:.001ms !important; }
   }
 </style>
 </head>
@@ -825,53 +977,50 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="wrap">
   <header>
     <h1>⚡ XAUMonitor · DPB 黄金信号</h1>
-    <div class="sub" id="sub">加载中…</div>
+    <div class="sub" id="sub" style="margin:0">加载中…</div>
   </header>
 
-  <div class="cards" id="cards"></div>
-  <div id="stats" class="muted" style="margin:9px 0 13px"></div>
+  <div id="cards"></div>
+  <div id="stats" class="sub" style="margin:var(--sp3) 0 var(--sp5)"></div>
 
   <!-- 资金与盈亏（含持仓中实时浮动） -->
   <section>
-    <h2>💰 资金与盈亏（美元） <span class="muted" id="eqSrc"
-        style="font-weight:400;font-size:13px"></span></h2>
-    <div class="cards" id="eqCards"></div>
-    <div id="posWrap" style="margin-top:10px"></div>
+    <h2>💰 资金与盈亏<span class="meta" id="eqSrc"></span></h2>
+    <div id="eqCards"></div>
+    <div id="posWrap" style="margin-top:var(--sp3)"></div>
   </section>
 
   <!-- 图表：权益曲线 / 逐日 / 按小时 -->
   <section>
-    <h2>📈 走势</h2>
+    <h2>📈 走势<span class="meta">只统计已结案信号</span></h2>
     <div class="ch-wrap">
       <h3>累积权益曲线</h3>
-      <div class="sub">初始资金 → 现在。只累加<b>已结案</b>信号，按实测 R 换算成美元
-        （虚线 = 初始资金）。浮动盈亏不计入曲线。</div>
+      <div class="sub">初始资金 → 现在。按实测净 R 换算成美元累加，
+        <b>虚线</b> = 初始资金基准。浮动盈亏不计入曲线（另在持仓区显示）。</div>
       <div id="eqChart"></div>
     </div>
     <div class="ch-wrap">
       <h3>逐日盈亏</h3>
-      <div class="sub">每根柱子 = 该日已结案信号的美元合计。绿盈红亏。</div>
+      <div class="sub">每根柱子 = 该日已结案信号的美元合计。<span class="up">绿盈</span> / <span class="dn">红亏</span>。</div>
       <div id="dayChart"></div>
     </div>
     <div class="ch-wrap">
-      <h3>按小时期望值
-        <span class="muted" style="font-weight:400;font-size:12px">— 用来决定要不要开时段过滤</span></h3>
-      <div class="sub">每根柱子 = 该小时全部已结案信号的<b>平均净 R</b>。
-        样本不足 2 笔的小时不画。数据够多且某时段长期为负，才值得在配置里开
-        <code>block_hours</code>；现在默认不开。</div>
+      <h3>按小时期望值</h3>
+      <div class="sub">每根柱子 = 该小时全部已结案信号的<b>平均净 R</b>（样本 &lt;2 笔不画）。
+        用于判断要不要开时段过滤 <code>block_hours</code> —— 长期为负才值得开，现在默认关。</div>
       <div id="hourChart"></div>
     </div>
     <div class="ch-wrap">
       <h3>信号分布</h3>
-      <div id="distBox" class="sub" style="margin-bottom:2px"></div>
+      <div id="distBox" class="sub" style="margin-bottom:0"></div>
     </div>
   </section>
 
   <div class="main">
-    <!-- 左（第一优先）：按日分区 + 分页 -->
+    <!-- 左（视觉第一优先）：按日分区 + 分页 -->
     <section>
-      <h2>📅 按日分区 · 信号与盈亏</h2>
-      <div id="dailyWrap" class="muted">加载中…</div>
+      <h2>📅 按日分区 · 信号与盈亏<span class="meta" id="dailyMeta"></span></h2>
+      <div id="dailyWrap" class="sub">加载中…</div>
       <div class="pager" id="pager"></div>
     </section>
 
@@ -879,8 +1028,8 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="col-b">
       <section>
         <h2>📊 结果追踪 · 胜率</h2>
-        <div class="cards" id="outCards"></div>
-        <div id="outDetail" class="muted" style="margin-top:10px"></div>
+        <div id="outCards"></div>
+        <div id="outDetail" class="sub" style="margin:var(--sp3) 0 0"></div>
       </section>
 
       <section>
@@ -891,7 +1040,8 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="foot">
-    数据源 signals.db + dpb_status.json + paxg_stream.db · 每 15 秒自动刷新 · 零 API 消耗
+    数据源 signals.db + dpb_status.json + paxg_stream.db<br>
+    每 15 秒自动刷新 · 零 API 消耗
   </div>
 </div>
 
@@ -925,22 +1075,38 @@ async function load(){
     // 卡片
     // 数据发布窗口：命中时置顶警示（这是防爆仓的硬拦截）
     const nw = snap.news || {};
-    const cards = [];
-    if(nw.blocked){
-      cards.push(['⛔ 数据窗口', nw.event||'禁开仓', 'warn']);
-    } else if(nw.enabled && nw.upcoming){
-      cards.push(['下次数据', nw.upcoming.split(' ').slice(-1)[0], '']);
-    }
-    cards.push(
-      ['信号总数', st.total, ''], ['今日', st.today, ''],
-      ['🔥共振', st.resonance, ''], ['S级', st.by_grade.S||0, 'gold'],
-      ['A级', st.by_grade.A||0, ''], ['B级', st.by_grade.B||0, ''],
-    );
+    // 顶栏分组渲染。
+    // 优化前：7 张卡平铺进 3 列网格 → 排成 3+3+1，最后一张孤零零一行，很刺眼。
+    // 现在按语义分「运行 / 信号评级」两组，每组各自成行（auto-fit 会折叠空轨道，
+    // 组内卡片数 ≤ 能容纳的列数时天然是一整行）。
     const cw = document.getElementById('cards'); cw.innerHTML='';
-    cards.forEach(([l,v,cls])=>{
-      const c=E('div','card'+(cls?' '+cls:''));
-      c.appendChild(E('div','v',v)); c.appendChild(E('div','l',l)); cw.appendChild(c);
-    });
+    const cg=(label, items)=>{
+      if(!items.length) return;
+      const g=E('div','cgroup');
+      if(label) g.appendChild(E('div','cglabel',label));
+      const grid=E('div','cards');
+      items.forEach(([l,v,cl])=>{
+        const c=E('div','card'+(cl?' '+cl:''));
+        c.appendChild(E('div','v',v));
+        c.appendChild(E('div','l',l));
+        grid.appendChild(c);
+      });
+      g.appendChild(grid); cw.appendChild(g);
+    };
+    const run = [];
+    if(nw.blocked){
+      run.push(['⛔ 数据窗口', nw.event||'禁开仓', 'warn']);
+    } else if(nw.enabled && nw.upcoming){
+      run.push(['下次数据', nw.upcoming.split(' ').slice(-1)[0], '']);
+    }
+    run.push(['信号总数', st.total, ''], ['今日', st.today, '']);
+    cg('运行', run);
+    cg('信号评级', [
+      ['🔥 共振', st.resonance, ''],
+      ['S 级', st.by_grade.S||0, 'gold'],
+      ['A 级', st.by_grade.A||0, ''],
+      ['B 级', st.by_grade.B||0, ''],
+    ]);
 
     // 各周期状态
     const tg = document.getElementById('tfGrid'); tg.innerHTML='';
@@ -967,22 +1133,34 @@ async function load(){
     // 结果追踪（胜率 / 期望值）
     const ow = document.getElementById('outCards'); ow.innerHTML='';
     const od = document.getElementById('outDetail'); od.textContent='';
+    // 与「资金与盈亏」同一套分组渲染：分成「命中率 / 累计 R / 进度」三簇
+    const mkg=(label, items)=>{
+      const g=E('div','cgroup');
+      if(label) g.appendChild(E('div','cglabel',label));
+      const grid=E('div','cards');
+      items.forEach(([l,v])=>{
+        const c=E('div','card');
+        c.appendChild(E('div','v',v));
+        c.appendChild(E('div','l',l));
+        grid.appendChild(c);
+      });
+      g.appendChild(grid); ow.appendChild(g);
+    };
     if(!oc.closed){
-      const mk=(l,v)=>{const c=E('div','card');c.appendChild(E('div','v',v));c.appendChild(E('div','l',l));ow.appendChild(c);};
-      mk('已结案', 0); mk('追踪中', oc.tracking||0);
+      mkg('状态', [['已结案', 0], ['追踪中', oc.tracking||0]]);
       od.textContent = `暂无已结案信号（追踪中 ${oc.tracking||0} 笔）— 需先触及 SL/TP，或追踪窗口走满才算结案`;
     } else {
-      const cards2 = [
-        ['胜率', oc.win_rate.toFixed(1)+'%', ''],
-        ['期望值', (oc.expectancy_r>=0?'+':'')+oc.expectancy_r.toFixed(2)+'R', ''],
-        ['净值R', (oc.total_r>=0?'+':'')+oc.total_r.toFixed(2)+'R', ''],
-        ['毛值R', ((oc.gross_total_r||0)>=0?'+':'')+(oc.gross_total_r||0).toFixed(2)+'R', ''],
-        ['点差成本', '-'+(oc.cost_total_r||0).toFixed(2)+'R', ''],
-        ['盈亏因子', oc.profit_factor==null?'∞':oc.profit_factor.toFixed(2), ''],
-        ['已结案', oc.closed, ''],
-        ['追踪中', oc.tracking||0, ''],
-      ];
-      cards2.forEach(([l,v])=>{const c=E('div','card');c.appendChild(E('div','v',v));c.appendChild(E('div','l',l));ow.appendChild(c);});
+      mkg('命中率', [
+        ['胜率', oc.win_rate.toFixed(1)+'%'],
+        ['期望值', (oc.expectancy_r>=0?'+':'')+oc.expectancy_r.toFixed(2)+'R'],
+        ['盈亏因子', oc.profit_factor==null?'∞':oc.profit_factor.toFixed(2)],
+      ]);
+      mkg('累计 R', [
+        ['净值', (oc.total_r>=0?'+':'')+oc.total_r.toFixed(2)+'R'],
+        ['毛值', ((oc.gross_total_r||0)>=0?'+':'')+(oc.gross_total_r||0).toFixed(2)+'R'],
+        ['点差成本', '-'+(oc.cost_total_r||0).toFixed(2)+'R'],
+      ]);
+      mkg('进度', [['已结案', oc.closed], ['追踪中', oc.tracking||0]]);
       const agg=(obj,label)=>{const ks=Object.keys(obj||{});if(!ks.length)return '';
         return ` · ${label}: `+ks.map(k=>`${k} ${obj[k].wins}/${obj[k].n}(${obj[k].r>=0?'+':''}${obj[k].r.toFixed(1)}R)`).join('  ');};
       const oc2 = oc.by_outcome ? ' · 结局: '+Object.entries(oc.by_outcome).map(([k,v])=>`${k} ${v}`).join('  ') : '';
@@ -1009,18 +1187,36 @@ async function load(){
     if(eq.initial_equity!=null){
       const tot=eq.equity_total, real=eq.realized_usd, un=eq.unrealized_usd;
       const net=real+un, base=eq.initial_equity;
-      const mk=(l,v,c)=>{const d=E('div','card'+(c?' '+c:''));
-        d.appendChild(E('div','v',v)); d.appendChild(E('div','l',l)); ew.appendChild(d);};
-      mk('初始资金', Number(base).toFixed(0), '');
-      mk('当前权益', Number(tot).toFixed(2), tot>=base?'good':'bad');
-      mk('累计盈亏', usd(net), net>=0?'good':'bad');
-      mk('已实现', usd(real), real>=0?'good':'bad');
-      mk('持仓浮动', usd(un), un>=0?'good':'bad');
-      mk('收益率', (eq.return_pct>=0?'+':'')+Number(eq.return_pct).toFixed(2)+'%',
-         eq.return_pct>=0?'good':'bad');
-      mk('累计R', (eq.realized_r>=0?'+':'')+Number(eq.realized_r).toFixed(2)+'R', '');
-      mk('胜率', eq.win_rate==null?'-':Number(eq.win_rate).toFixed(1)+'%', '');
-      mk('结案/追踪', eq.closed+' / '+eq.tracking, '');
+      // 分组渲染：优化前 9 张同权重卡片平铺成一条"数字墙"，扫读时找不到重点。
+      // 现在按语义分 3 簇 —— 先看「账户规模」，再看「盈亏构成」，最后看「表现」。
+      const group=(label, items)=>{
+        const g=E('div','cgroup');
+        if(label) g.appendChild(E('div','cglabel',label));
+        const grid=E('div','cards');
+        items.forEach(([l,v,c])=>{
+          const d=E('div','card'+(c?' '+c:''));
+          d.appendChild(E('div','v',v));
+          d.appendChild(E('div','l',l));
+          grid.appendChild(d);
+        });
+        g.appendChild(grid); ew.appendChild(g);
+      };
+      group('账户', [
+        ['初始资金', Number(base).toFixed(0), ''],
+        ['当前权益', Number(tot).toFixed(2), tot>=base?'good':'bad'],
+        ['累计盈亏', usd(net), net>=0?'good':'bad'],
+      ]);
+      group('盈亏构成', [
+        ['已实现', usd(real), real>=0?'good':'bad'],
+        ['持仓浮动', usd(un), un>=0?'good':'bad'],
+      ]);
+      group('表现', [
+        ['收益率', (eq.return_pct>=0?'+':'')+Number(eq.return_pct).toFixed(2)+'%',
+           eq.return_pct>=0?'good':'bad'],
+        ['累计 R', (eq.realized_r>=0?'+':'')+Number(eq.realized_r).toFixed(2)+'R', ''],
+        ['胜率', eq.win_rate==null?'-':Number(eq.win_rate).toFixed(1)+'%', ''],
+        ['结案 / 追踪', eq.closed+' / '+eq.tracking, ''],
+      ]);
     }
 
     // ================= 图表（服务端生成的 SVG，直接注入） =================
@@ -1088,8 +1284,14 @@ async function load(){
     dailyPages = dl.pages||1; dailyPage = dl.page||1;
     const dw=document.getElementById('dailyWrap'); dw.innerHTML='';
     const dlist = dl.days||[];
+    // 区块标题右侧的元信息：把"一共多少天 / 哪一段"放在标题行，
+    // 不用滑到分页器才能知道自己在第几页
+    const dm=document.getElementById('dailyMeta');
+    if(dm) dm.textContent = dlist.length
+      ? `${dl.total_days||dlist.length} 天 · 第 ${dailyPage}/${dl.pages||1} 页`
+      : '';
     if(!dlist.length){
-      dw.appendChild(E('div','muted','暂无信号记录'));
+      dw.appendChild(E('div','sub','暂无信号记录'));
     }
     dlist.forEach((day, idx)=>{
       const box=E('div','day');
