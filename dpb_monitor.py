@@ -1558,7 +1558,7 @@ def cfg_tag(cfg: dict) -> str:
 
 
 def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2,
-                   r_size, resonance, lots=None, tag=None):
+                   r_size, resonance, lots=None, tag=None, pct=None, be=None):
     """写入一条信号记录（失败仅记日志，不影响推送）
 
     lots / tag 是可选的：程序建议的手数、以及当期的参数版本标签。
@@ -1570,8 +1570,8 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2,
             conn.execute(
                 "INSERT INTO signals (ts, pushed_at, timeframe, direction, sig_type, grade,"
                 " score, band, entry, sl, tp1, tp2, r_size, rsi, atr, resonance, close,"
-                " lots, cfg_tag)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " lots, cfg_tag, pct, be)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row.name.isoformat(),
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1587,6 +1587,8 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2,
                     float(row["Close"]),
                     (float(lots) if lots is not None else None),
                     tag,
+                    (float(pct) if pct is not None else None),
+                    (int(bool(be)) if be is not None else None),
                 ),
             )
             conn.commit()
@@ -1753,7 +1755,8 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
     try:
         with sqlite3.connect(_db_path(db_file)) as conn:
             rows = conn.execute(
-                "SELECT s.id, s.timeframe, s.direction, s.entry, s.sl, s.tp1, s.tp2, s.r_size, s.ts"
+                "SELECT s.id, s.timeframe, s.direction, s.entry, s.sl, s.tp1, s.tp2, s.r_size, s.ts,"
+                " s.pct, s.be"
                 " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
                 # 未结案的都要继续追踪：除 open 外，TP1 也可能还在往 TP2 走，
                 # 所以判据是 resolved_at 为空，而不是 outcome='open'
@@ -1791,10 +1794,22 @@ def evaluate_outcomes(cfg: dict, max_bars: int = 300, df_cache: dict = None) -> 
                 log.error(f"[追踪] {tf} 取数失败: {e}")
                 continue
 
-        for (sid, _tf, direction, entry, sl, tp1, tp2, r_size, ts) in sigs:
+        for (sid, _tf, direction, entry, sl, tp1, tp2, r_size, ts, s_pct, s_be) in sigs:
+            # 用「信号发出当时」的止盈规则评估，而不是当前配置。
+            #
+            # 为什么：参数一改，历史未结案信号的 tp1/tp2 是旧规则定的，
+            # 但它们会在结案时读到**新**的 tp1_exit_pct。
+            # 后果是同一批统计里混着两种赔率结构（比如旧 4h 信号被按 1:4 结算），
+            # 看似正常，实际把 A/B 对比污染了。
+            # 新信号会把自己的 pct/be 落库，于是各按各的规则结算。
+            sub_cfg = dict(cfg)
+            if s_pct is not None:
+                sub_cfg["tp1_exit_pct"] = float(s_pct)
+            if s_be is not None:
+                sub_cfg["be_after_tp1"] = bool(s_be)
             try:
                 res = _evaluate_one(df, direction, entry, sl, tp1, tp2, r_size, ts,
-                                    int(mb_cfg.get(tf, max_bars)), cfg)
+                                    int(mb_cfg.get(tf, max_bars)), sub_cfg)
             except Exception as e:
                 log.error(f"[追踪] 信号#{sid} 评估失败: {e}")
                 continue
@@ -2434,6 +2449,10 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
                 # 版本标签是把「改参数前/后」分开统计的前提（A/B 对比）
                 (ps["lots"] if (ps and ps.get("ok")) else None),
                 cfg_tag(cfg),
+                # 把「发出时的止盈规则」一起存下来：结案时按它评估，
+                # 而不是按当时的最新配置 —— 否则改参数会把历史信号一起改判
+                cfg.get("tp1_exit_pct"),
+                cfg.get("be_after_tp1"),
             )
         except Exception as e:
             log.error(f"[错误] {tf} 推送失败: {e}")

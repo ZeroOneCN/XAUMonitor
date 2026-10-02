@@ -113,11 +113,17 @@ print(f"  {'✅ 通过' if ok5 else '❌ 失败'}")
 
 print()
 print("=" * 76)
+# 用例⑥要单独验证「连亏冷静期」。但 3 笔 -1R = -$19.50，正好等于 $650 的 3% 熔断线，
+# 「单日亏损熔断」会正确地先把它拦下 —— 于是用例测到的是熔断而不是冷静期。
+# 隔离办法：把这个用例的熔断阈值调到测不到，只留冷静期这一道门。
+CFG_COOL = dict(CFG, risk_gate=dict(CFG.get("risk_gate", {}),
+                                    daily_loss_limit_pct=999, max_open_positions=0))
+
 print("⑥ 冷静期满（最后一笔 6 小时前）→ 应放行")
 print("=" * 76)
 t2 = (datetime.now() - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
 build([(1, -1.0, t2), (2, -1.0, t2), (3, -1.0, t2)])
-r = m.risk_gate(CFG)
+r = m.risk_gate(CFG_COOL)
 print(f"  allowed={r['allowed']}  reasons={r['reasons']}")
 print(f"  距最后一笔 {r['detail'].get('cooldown_hours_since', 0):.1f} 小时")
 ok6 = r["allowed"] is True
