@@ -1231,9 +1231,19 @@ def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
 
     r_size = max(abs(entry - sl), (atr * 0.1) if (atr and not np.isnan(atr)) else 0.01)
 
+    # 止盈倍数：优先读配置里的 tp_plan[tf]，便于 A/B 对比不同止盈结构；
+    # 没配就退回按周期递增的默认值（周期越大，目标放得越远）。
+    #
+    # ⚠️ 关键：当 tp1_exit_pct = 0（不做部分了结）时，仓位会一路持到 TP2，
+    # 所以**实际目标由 r2 决定**，r1 只影响推送文案。
+    # 想要干净的 1:2，必须令 r1 = r2 = 2.0；只改 r1 会把 1:2 悄悄变成 1:4。
     tf_min_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
     tf_min = tf_min_map.get(tf, 60)
-    if tf_min <= 15:
+    plan = (cfg.get("tp_plan") or {}).get(tf) or {}
+    if plan:
+        r1 = float(plan.get("r1", 1.0))
+        r2 = float(plan.get("r2", 2.0))
+    elif tf_min <= 15:
         r1, r2 = 1.0, 2.0
     elif tf_min <= 60:
         r1, r2 = 1.5, 3.0
@@ -1277,12 +1287,16 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
     title += f"{lot_txt} SL:{sl:.2f} TP1:{tp1:.2f}"
 
     # 内容：完整做单卡片
+    # 当 r1 == r2（= 全仓持到单一目标，即「1:2」这类结构）时不重复输出两行，
+    # 否则推送里会出现两个一模一样的止盈价，看起来像写错了。
+    _tps = ([f"> 🎯 止盈: **{tp1:.2f}**  ({r1}R)  止损 {r_size:.2f} → 赔率 1:{r1:g}"]
+            if abs(r1 - r2) < 1e-9 else
+            [f"> TP1: **{tp1:.2f}**  ({r1}R)",
+             f"> TP2: **{tp2:.2f}**  ({r2}R)"])
     lines = [
         f"> 入场: **{entry:.2f}**",
         f"> 止损: **{sl:.2f}**  (距离 {r_size:.2f})",
-        f"> TP1: **{tp1:.2f}**  ({r1}R)",
-        f"> TP2: **{tp2:.2f}**  ({r2}R)",
-    ]
+    ] + _tps
     # 斐波那契：回撤区（入场位置质量）+ 扩展目标（另一组止盈参考）
     if cfg.get("show_fib", True):
         z = _fib_zone(row, signal > 0, row.get("atr"))
@@ -1524,14 +1538,40 @@ def init_db(db_file: str):
         log.error(f"[DB] 建表失败: {e}")
 
 
-def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_size, resonance):
-    """写入一条信号记录（失败仅记日志，不影响推送）"""
+def cfg_tag(cfg: dict) -> str:
+    """给当前参数组合生成一个短标签，写进每条信号。
+
+    为什么需要：改参数之后，「新数据变好」和「新参数更好」是两件事。
+    没有标签就只能拿改前改后的平均值硬比，还会被行情阶段混淆。
+    有了标签可以按参数期分组对比，这是 A/B 的前提。
+    """
+    try:
+        plan = (cfg.get("tp_plan") or {})
+        r2s = sorted({float(v.get("r2", 0)) for v in plan.values()}) if plan else []
+        rr = "/".join(f"{x:g}" for x in r2s) if r2s else "def"
+        tfs = "-".join(sorted((cfg.get("timeframes") or {}).keys())) or "?"
+        return (f"tf={tfs}|tp={rr}|p={float(cfg.get('tp1_exit_pct', 0.5)):g}"
+                f"|be={int(bool(cfg.get('be_after_tp1', True)))}"
+                f"|slATR={cfg.get('min_sl_atr', 0.3)}")
+    except Exception:
+        return "unknown"
+
+
+def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2,
+                   r_size, resonance, lots=None, tag=None):
+    """写入一条信号记录（失败仅记日志，不影响推送）
+
+    lots / tag 是可选的：程序建议的手数、以及当期的参数版本标签。
+    把「程序自己算的手数」落库，是为了事后能审计「它到底建议了多少手」，
+    而不是只能从推送消息里翻。
+    """
     try:
         with sqlite3.connect(_db_path(db_file)) as conn:
             conn.execute(
                 "INSERT INTO signals (ts, pushed_at, timeframe, direction, sig_type, grade,"
-                " score, band, entry, sl, tp1, tp2, r_size, rsi, atr, resonance, close)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " score, band, entry, sl, tp1, tp2, r_size, rsi, atr, resonance, close,"
+                " lots, cfg_tag)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row.name.isoformat(),
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1545,6 +1585,8 @@ def save_signal_db(db_file: str, tf: str, sig: int, row, entry, sl, tp1, tp2, r_
                     float(row["rsi"]), float(row["atr"]),
                     int(resonance or 0),
                     float(row["Close"]),
+                    (float(lots) if lots is not None else None),
+                    tag,
                 ),
             )
             conn.commit()
@@ -2387,6 +2429,11 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
                 cfg.get("db_file", "signals.db"), tf, sig, last,
                 entry, sl, tp1, tp2, r_size,
                 len(res_tfs) if res_tfs else 0,
+                # 落库：程序建议的手数 + 当期参数版本标签
+                # 手数入库才能事后审计「程序自己决定的下单量」是否合理；
+                # 版本标签是把「改参数前/后」分开统计的前提（A/B 对比）
+                (ps["lots"] if (ps and ps.get("ok")) else None),
+                cfg_tag(cfg),
             )
         except Exception as e:
             log.error(f"[错误] {tf} 推送失败: {e}")

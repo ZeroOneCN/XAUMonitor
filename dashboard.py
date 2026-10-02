@@ -440,8 +440,32 @@ def api_equity():
     gross_win = sum(x["pnl_usd"] for x in wins)
     gross_loss = abs(sum(x["pnl_usd"] for x in closed if (x["r_multiple"] or 0) <= 0))
 
+    # ---- 资金流水调整（让「入金」不再被误读成「盈利」）----
+    # 没有这一层时：中途补 1000 保证金，权益曲线会凭空跳高 1000，
+    # 在图上看起来就是「这笔赚回来了」。真实盈亏必须扣掉累计入金。
+    try:
+        import capital as _cap
+        net_deposits = _cap.total()
+    except Exception as e:
+        log.warning(f"[equity] 读入金台账失败，退化为 0：{e}")
+        net_deposits = 0.0
+    equity_total = init + realized + unrealized
+    if net_deposits > 0:
+        true_pnl = equity_total - net_deposits
+        true_pct = true_pnl / net_deposits * 100.0
+    else:
+        true_pnl = realized + unrealized
+        true_pct = None
+    # 配置里的 account_equity 与台账总额不一致时明确告警：
+    # 两者长期不等会让「真实收益率」分母失真。
+    cfg_drift = (net_deposits > 0 and abs(init - net_deposits) > 0.5)
+
     return {
         "initial_equity": init,
+        "net_deposits": net_deposits,
+        "true_pnl": true_pnl,
+        "true_return_pct": true_pct,
+        "capital_drift": cfg_drift,
         "oz_per_trade": oz,
         "equity_realized": init + realized,
         "equity_total": init + realized + unrealized,
@@ -642,7 +666,34 @@ def api_charts():
     # ---- 累积权益曲线 + 逐日金额 ----
     # 不用手写循环累加，统一走 _sum_pnl（单一来源，避免再出现「某个面板
     # 漏了 entry/sl 就静默算成 0」这类问题）
-    cum, eq_pts, day_pts = init, [], []
+    # 权益曲线的基准 = 「当日累计入金」，而不是常数 init。
+    # 用常数 init 的后果：中途补保证金会让曲线出现一段凭空的垂直跳升，
+    # 在图上看起来就是「这笔赚回来了」——这正是要防的自我欺骗。
+    # 用累计入金做基准后，曲线只剩「真实盈亏」造成的涨跌，入金段表现为台阶。
+    try:
+        import capital as _cap
+        _dep_ok = bool(_cap.all_flows())
+    except Exception as e:
+        log.warning(f"[charts] 读入金台账失败，退化为常数基准：{e}")
+        _cap, _dep_ok = None, False
+
+    def _base_of(day: str) -> float:
+        if _dep_ok:
+            try:
+                v = _cap.deposits_up_to(day)
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+        return init
+
+    # 曲线画「累计真实盈亏」而不是「账户权益」。
+    #
+    # 为什么不用权益：入金台阶（650→2000 一次补 1350）会把纵轴撑到
+    # 几百美元的跨度，而真实盈亏只有两百多——曲线的波动被压成一条细线，
+    # 图就失去判断策略好坏的作用了。
+    # 累计盈亏天然免疫入金（补钱不改变已实现盈亏），纵轴留给策略本身。
+    cum, eq_pts, day_pts = 0.0, [], []
     for d in sorted(days):
         usd = _sum_pnl([r for r in days[d] if r.get("resolved_at")], oz, f"[charts {d}]")
         cum += usd
@@ -677,7 +728,8 @@ def api_charts():
         "hour_n": {f"{h}点": len(v) for h, v in sorted(hours.items())},
     }
     return {
-        "equity_svg": _svg_line(eq_pts, base=init),
+        # base=0：曲线是「累计盈亏」，基准线就是零轴（入金不参与，天然免疫）
+        "equity_svg": _svg_line(eq_pts, base=0.0),
         "daily_svg": _svg_bars(day_pts, fmt="{:+.2f}", unit=" USD"),
         "hour_svg": _svg_bars(hour_pts, fmt="{:+.2f}", unit=" R/笔"),
         "samples": {"days": len(days), "resolved": sum(
@@ -994,9 +1046,10 @@ HTML_PAGE = """<!DOCTYPE html>
   <section>
     <h2>📈 走势<span class="meta">只统计已结案信号</span></h2>
     <div class="ch-wrap">
-      <h3>累积权益曲线</h3>
-      <div class="sub">初始资金 → 现在。按实测净 R 换算成美元累加，
-        <b>虚线</b> = 初始资金基准。浮动盈亏不计入曲线（另在持仓区显示）。</div>
+      <h3>累计真实盈亏曲线</h3>
+      <div class="sub">累计<b>已实现盈亏</b>（美元），从 0 起算 —— <b>不包含入金</b>，
+        所以补保证金不会让曲线变好看。零轴虚线 = 不赚不亏。
+        当前真实盈亏见上方「账户」卡。浮动盈亏不计入曲线。</div>
       <div id="eqChart"></div>
     </div>
     <div class="ch-wrap">
@@ -1201,22 +1254,34 @@ async function load(){
         });
         g.appendChild(grid); ew.appendChild(g);
       };
+      // 强调「真实」口径：入金不算盈利。
+      // 累计入金 / 真实盈亏 / 真实收益率 放在最前面，
+      // 就是让「我今天补了钱」和「我今天赚了钱」在页面上不可能混淆。
+      const dep = eq.net_deposits;
+      const truePnl = (eq.true_pnl!=null) ? eq.true_pnl : net;
+      const truePct = eq.true_return_pct;
+      const mkDrift = eq.capital_drift;
       group('账户', [
-        ['初始资金', Number(base).toFixed(0), ''],
-        ['当前权益', Number(tot).toFixed(2), tot>=base?'good':'bad'],
-        ['累计盈亏', usd(net), net>=0?'good':'bad'],
+        ['累计入金', dep?Number(dep).toFixed(0):'-', ''],
+        ['当前权益', Number(tot).toFixed(2), tot>=(dep||base)?'good':'bad'],
+        ['真实盈亏', usd(truePnl), truePnl>=0?'good':'bad'],
       ]);
       group('盈亏构成', [
         ['已实现', usd(real), real>=0?'good':'bad'],
         ['持仓浮动', usd(un), un>=0?'good':'bad'],
       ]);
       group('表现', [
-        ['收益率', (eq.return_pct>=0?'+':'')+Number(eq.return_pct).toFixed(2)+'%',
-           eq.return_pct>=0?'good':'bad'],
+        ['真实收益率', truePct==null?'-':(truePct>=0?'+':'')+Number(truePct).toFixed(2)+'%',
+           truePct==null?'':(truePct>=0?'good':'bad')],
         ['累计 R', (eq.realized_r>=0?'+':'')+Number(eq.realized_r).toFixed(2)+'R', ''],
         ['胜率', eq.win_rate==null?'-':Number(eq.win_rate).toFixed(1)+'%', ''],
         ['结案 / 追踪', eq.closed+' / '+eq.tracking, ''],
       ]);
+      if(mkDrift){
+        const w=E('div','sub dn','⚠️ 配置 account_equity（'+Number(base).toFixed(0)+
+          '）与入金台账累计（'+Number(dep).toFixed(2)+'）不一致，真实收益率分母会失真，请对齐两者');
+        w.style.marginTop='6px'; ew.appendChild(w);
+      }
     }
 
     // ================= 图表（服务端生成的 SVG，直接注入） =================
