@@ -797,6 +797,9 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   *{ box-sizing:border-box; -webkit-text-size-adjust:100%; }
+  /* 长串（配置说明、UA、合并后的地址）默认不换行会把整页撑宽，
+     手机上表现为右侧内容被裁掉一截。 */
+  .sub, #stats, .card, .sig, .pos{ overflow-wrap:anywhere; }
 
   body{
     margin:0; background:var(--bg); color:var(--fg);
@@ -812,7 +815,11 @@ HTML_PAGE = """<!DOCTYPE html>
     text-rendering:optimizeLegibility;
   }
 
-  .wrap{ max-width:1240px; margin:0 auto; padding:var(--sp3) var(--sp3) var(--sp6); }
+  .wrap{ max-width:1240px; margin:0 auto; padding:var(--sp3) var(--sp3) var(--sp6); overflow-x:clip; }
+  /* 宽表格自己滚，不要把整页撑出屏幕 */
+  table{ display:block; width:100%; overflow-x:auto; }
+  /* 不加 body{overflow-x:hidden}：它会把真实的横向溢出藏起来，
+     让内容静默被裁掉。宁可让它滚，也不要看不见。 */
 
   /* ───── 页头 ───── */
   header{
@@ -855,7 +862,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .cards{
     display:flex; flex-wrap:wrap; gap:var(--sp2);
   }
-  .cards > .card{ flex:1 1 140px; max-width:280px; }
+  .cards > .card{ flex:1 1 140px; max-width:280px; min-width:0; }
   .card{
     background:var(--s1); border:1px solid var(--line); border-radius:var(--r2);
     padding:var(--sp3); min-width:0;
