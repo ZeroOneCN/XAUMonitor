@@ -2625,7 +2625,7 @@ def check_signals(cfg: dict, state: dict, df_cache: dict = None) -> dict:
             atr = last["atr"]
 
             # 做单策略：仓位管理（与推送内容同源，避免两处算法漂移）
-            ps = calc_position_size(entry, sl, cfg) if cfg.get("use_position_sizing", True) else None
+            ps = calc_position_size(entry, sl, cfg, tf=tf, direction=sig) if cfg.get("use_position_sizing", True) else None
             lot_tag = (
                 f" | 手数:{ps['lots']:.2f}(风险${ps['actual_risk']:.2f})"
                 if ps and ps.get("ok") else ""
