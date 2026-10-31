@@ -612,10 +612,14 @@ def _svg_line(pts, w=660, h=150, pad=26, base=None, fmt="{:.2f}"):
     out.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="#0a7f4b"/>')
     out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="10">'
                f'{_esc(fmt.format(hi))}</text>')
-    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="10">'
+    out.append(f'<text x="{pad}" y="{h-17}" fill="#4a5568" font-size="10">'
                f'{_esc(fmt.format(lo))}</text>')
-    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="10"'
-               ' text-anchor="end">' + _esc(pts[-1][0]) + '</text>')
+    # 时间轴标三处：只标终点看不出这段曲线跨了多久
+    _last = len(pts) - 1
+    for _i, _a, _x in ((0, "start", pad), (_last // 2, "middle", pad + iw / 2),
+                       (_last, "end", w - pad)):
+        out.append(f'<text x="{_x:.1f}" y="{h-3}" fill="#4a5568" font-size="10"'
+                   f' text-anchor="{_a}">{_esc(pts[_i][0])}</text>')
     out.append("</svg>")
     return "".join(out)
 
@@ -641,11 +645,16 @@ def _svg_bars(pts, w=660, h=140, pad=26, fmt="{:.2f}", unit=""):
         out.append(f'<rect x="{cx-bw/2:.1f}" y="{y:.1f}" width="{bw:.1f}"'
                    f' height="{max(bh,0.6):.1f}" fill="{col}" rx="1.5"/>')
     out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="10">'
-               f'±{_esc(fmt.format(mx))}{_esc(unit)}</text>')
+               f'{_esc(fmt.format(mx))}{_esc(unit)}</text>')
     out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="10">'
                f'{_esc(pts[0][0])}</text>')
     out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="10"'
                f' text-anchor="end">{_esc(pts[-1][0])}</text>')
+    # 柱子多时只有首尾两个日期，读不出中间那段是哪天
+    if len(pts) >= 5:
+        _mi = len(pts) // 2
+        out.append(f'<text x="{pad + iw / 2:.1f}" y="{h-6}" fill="#4a5568"'
+                   f' font-size="10" text-anchor="middle">{_esc(pts[_mi][0])}</text>')
     out.append("</svg>")
     return "".join(out)
 
@@ -748,9 +757,38 @@ def api_charts():
     }
 
 
+def _acct_line() -> str:
+    """头部一行：账户哪天开的、已运行多少天、累计入金多少。
+
+    「运行多久」用首个入金日算，而不是进程启动时间 ——
+    进程重启过很多次，那个数字对判断策略周期没有意义。
+    """
+    try:
+        import capital as _cap
+        flows = _cap.all_flows() or []
+    except Exception:
+        flows = []
+    if not flows:
+        return ""
+    dates = sorted(str(f.get("date") or f.get("flow_date") or "")[:10] for f in flows)
+    start = dates[0] if dates and dates[0] else ""
+    if not start:
+        return ""
+    from datetime import date as _date
+    try:
+        days = (_date.today() - _date.fromisoformat(start)).days + 1
+    except ValueError:
+        days = 0
+    tot = sum(float(f.get("amount") or 0) for f in flows)
+    return (f'<div class="sub" id="acctRun" style="margin:6px 0 0">'
+            f'开户 <b>{start}</b> · 已运行 <b>{days}</b> 天 · '
+            f'累计入金 <b>${tot:,.0f}</b></div>')
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML_PAGE
+    # 把「开户日 / 运行天数」注入到头部，随页面刷新更新
+    return HTML_PAGE.replace("</header>", (_acct_line() or "") + "</header>", 1)
 
 
 HTML_PAGE = """<!DOCTYPE html>
