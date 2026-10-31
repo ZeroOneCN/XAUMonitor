@@ -1049,6 +1049,12 @@ HTML_PAGE = """<!DOCTYPE html>
   @media (prefers-reduced-motion:reduce){
     *{ animation-duration:.001ms !important; transition-duration:.001ms !important; }
   }
+  /* 窄屏：带右侧 .meta 的标题会被挤成两三行（"💰 资 / 金与盈 / 亏"）。
+     让 meta 独占一行，标题保持完整。 */
+  @media (max-width:600px){
+    h2{ flex-wrap:wrap; }
+    h2 .meta{ margin-left:0; flex-basis:100%; }
+  }
 </style>
 </head>
 <body>
