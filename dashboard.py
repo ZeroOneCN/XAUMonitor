@@ -783,6 +783,7 @@ HTML_PAGE = """<!DOCTYPE html>
     --fg3:#718096;     /* 弱：脚注、单位 */
     /* ── 语义色（浅底上要压深，否则对比度不够） ── */
     --up:#0a7f4b; --dn:#c62828; --warn:#8a5a00; --info:#1a56db;
+    --money:#b8860b;   /* 金额金（浅底可读的深金） */
     --up-bg:#e7f7ef; --dn-bg:#fdecec; --warn-bg:#fdf4e3;
     /* ── 空间（4px 基准，6 级） ── */
     --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px; --sp5:22px; --sp6:30px;
@@ -951,7 +952,7 @@ HTML_PAGE = """<!DOCTYPE html>
     border-bottom:1px solid var(--line); cursor:pointer; user-select:none;
     transition:background .15s;
   }
-  .dayhead:hover{ background:#28323f; }
+  .dayhead:hover{ background:#e3eaf3; }
   .dayhead .dt{ font-size:var(--fs-md); font-weight:800; letter-spacing:-.1px; }
   .dayhead .caret{ color:var(--fg3); font-size:var(--fs-xs); }
   .dayhead .sp{
@@ -996,7 +997,7 @@ HTML_PAGE = """<!DOCTYPE html>
     cursor:pointer; transition:background .15s,border-color .15s;
     font-variant-numeric:tabular-nums;
   }
-  .pager button:hover:not(:disabled){ background:var(--s3); border-color:#3a4653; }
+  .pager button:hover:not(:disabled){ background:var(--s3); border-color:var(--line); }
   .pager button:disabled{ opacity:.32; cursor:default; }
   .pager button:focus-visible{ outline:2px solid var(--info); outline-offset:2px; }
   .pager .pg{ color:var(--fg2); font-size:var(--fs-xs); min-width:96px; text-align:center; }
@@ -1077,12 +1078,14 @@ HTML_PAGE = """<!DOCTYPE html>
   /* ══════ 曲线铺满卡片内容区 ══════ */
   .chart{ max-width:none; }
 
-  /* ══════ 深色数据块：浅底页面上保留黑色对比区 ══════ */
-  .dayhead, .pos, .row-sig, .sig, .tf{
-    --fg:#e9eff7; --fg2:#aab7c6; --fg3:#8792a1;
-    --line:#2a3340; --line2:#1f2733; --s2:#1a212b;
-    background:#12171f; color:var(--fg); border-color:var(--line);
-  }
+  /* ══════ 数据块一律浅色（全站无深色区） ══════ */
+  .dayhead{ background:var(--s3); }
+  .pos, .row-sig, .sig, .tf{ background:var(--s1); }
+
+  /* ══════ 金额用金色，盈亏用绿/红 ══════ */
+  /* 纯金 #d4af37 在白底上几乎读不出，压深到 #b8860b 才可读；
+     靠字号加粗 + 大号位数保证辨识度，而不是靠提亮。 */
+  .card.money .v{ color:var(--money); }
 </style>
 </head>
 <body>
@@ -1221,6 +1224,17 @@ if (location.hash) { const id = location.hash.slice(1);
   if (document.getElementById(id) && document.getElementById(id).classList.contains('pane')) showPane(id); }
 
 const E = (t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;};
+// 金额类卡片用金色；涨跌/盈亏用绿红（cl 有值时不加 money，
+// 否则 .card.good 的绿会被 .card.money 覆盖掉）
+const MONEY_RE = /入金|权益|盈亏|收益|浮动|余额|金额|净值|成本/;
+const cardCls = (cl, label, val) => {
+  if (cl) return 'card ' + cl;                       // 显式指定优先
+  const t = String(val == null ? '' : val).trim();
+  if (/^[-−]/.test(t)) return 'card bad';            // 负值 = 亏损红
+  if (/^\+/.test(t))  return 'card good';           // 带 + 号 = 盈利绿
+  if (MONEY_RE.test(String(label))) return 'card money';  // 金额 = 金色
+  return 'card';
+};
 const fmtN = v => (v==null?'-':v);
 // 每日分区：分页状态必须放在 load() 外面，否则每次自动刷新都会跳回第 1 页
 let dailyPage = 1, dailyPages = 1;
@@ -1260,7 +1274,7 @@ async function load(){
       if(label) g.appendChild(E('div','cglabel',label));
       const grid=E('div','cards');
       items.forEach(([l,v,cl])=>{
-        const c=E('div','card'+(cl?' '+cl:''));
+        const c=E('div',cardCls(cl,l,v));
         c.appendChild(E('div','v',v));
         c.appendChild(E('div','l',l));
         grid.appendChild(c);
@@ -1313,7 +1327,7 @@ async function load(){
       if(label) g.appendChild(E('div','cglabel',label));
       const grid=E('div','cards');
       items.forEach(([l,v])=>{
-        const c=E('div','card');
+        const c=E('div',cardCls('',l,v));
         c.appendChild(E('div','v',v));
         c.appendChild(E('div','l',l));
         grid.appendChild(c);
@@ -1368,7 +1382,7 @@ async function load(){
         if(label) g.appendChild(E('div','cglabel',label));
         const grid=E('div','cards');
         items.forEach(([l,v,c])=>{
-          const d=E('div','card'+(c?' '+c:''));
+          const d=E('div',cardCls(c,l,v));
           d.appendChild(E('div','v',v));
           d.appendChild(E('div','l',l));
           grid.appendChild(d);
@@ -1384,7 +1398,7 @@ async function load(){
       const mkDrift = eq.capital_drift;
       group('账户', [
         ['累计入金', dep?Number(dep).toFixed(0):'-', ''],
-        ['当前权益', Number(tot).toFixed(2), tot>=(dep||base)?'good':'bad'],
+        ['当前权益', Number(tot).toFixed(2), ''],   // 余额属金额，走金色；盈亏另列
         ['真实盈亏', usd(truePnl), truePnl>=0?'good':'bad'],
       ]);
       group('盈亏构成', [
