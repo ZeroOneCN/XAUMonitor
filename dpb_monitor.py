@@ -1477,7 +1477,19 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
 
     # 做单策略：仓位管理
     ps = calc_position_size(entry, sl, cfg, tf=tf, direction=sig) if cfg.get("use_position_sizing", True) else None
-    lot_txt = f" {ps['lots']:.2f}手" if ps and ps.get("ok") else ""
+    # 推送里直接写清「多少手 / 承担多少钱 / 为什么是这个量」，
+    # 不用回后台查。加仓单和「止损过宽」必须显式标出来，
+    # 否则用户看不出这单比平时小是因为账户不够还是因为被降档。
+    if ps and ps.get("ok"):
+        _tags = []
+        if ps.get("add_on"):
+            _tags.append("加仓")
+        if ps.get("capped") == "undersized":
+            _tags.append("止损过宽")
+        _suffix = (" " + "/".join(_tags)) if _tags else ""
+        lot_txt = f" {ps['lots']:.2f}手 风险${ps['actual_risk']:.0f}{_suffix}"
+    else:
+        lot_txt = ""
 
     # 标题：手机通知预览里就能看到 方向/周期/价格/手数/止损止盈
     title = f"{'🟢' if signal > 0 else '🔴'}{d} {tf} {entry:.2f}"
