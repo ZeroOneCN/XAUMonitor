@@ -190,7 +190,7 @@ def api_signals(limit: int = 60):
     rows = _query(
         "SELECT s.id, s.ts, s.pushed_at, s.timeframe, s.direction, s.sig_type, s.grade, s.score,"
         " s.band, s.entry, s.sl, s.tp1, s.tp2, s.rsi, s.atr, s.resonance,"
-        " o.outcome, o.r_multiple, o.resolved_at"
+        " s.lots, o.outcome, o.r_multiple, o.resolved_at"
         " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
         " ORDER BY s.id DESC LIMIT ?",
         (int(limit),),
@@ -292,7 +292,7 @@ def _oz_per_trade(cfg: dict) -> float:
     return _num(cfg, "min_lot", 0.01) * _num(cfg, "contract_oz", 100.0)
 
 
-def _pnl_usd(r: dict, oz: float):
+def _pnl_usd(r: dict, oz: float, contract_oz: float = 100.0):
     """单笔盈亏（美元）；数据不完整时返回 **None**（而不是 0）。
 
     net_r 是「以止损距离为 1R」的净倍数（已扣点差），所以
@@ -313,7 +313,16 @@ def _pnl_usd(r: dict, oz: float):
     risk = abs(float(entry) - float(sl))
     if risk < 1e-9:
         return None
-    return float(r["r_multiple"]) * risk * oz
+    # 用真实手数换算盎司数；老信号没有 lots 列时退回「最小手数」口径。
+    # 不改这里：0.16 手那笔真实赚 $36.4 会被记成 $2.28，
+    # 权益被系统性低估 → 动态手数会按虚高的本金下单。宁可精确。
+    lots = r.get("lots")
+    try:
+        q = float(lots) if lots is not None else 0.0
+    except (TypeError, ValueError):
+        q = 0.0
+    per_oz = q * contract_oz if q > 0 else oz
+    return float(r["r_multiple"]) * risk * per_oz
 
 
 def _sum_pnl(rs, oz, where="") -> float:
@@ -406,7 +415,7 @@ def api_equity():
     rows = _query(
         "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.score, s.entry, s.sl,"
         " s.tp1, s.tp2, s.pushed_at, o.resolved_at,"
-        " o.outcome, o.r_multiple, o.cost_r, o.bars"
+        " s.lots, o.outcome, o.r_multiple, o.cost_r, o.bars"
         " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
         " ORDER BY s.id"
     )
@@ -496,7 +505,7 @@ def api_daily(page: int = 1, per_page: int = 5):
     rows = _query(
         "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.score, s.entry, s.sl,"
         " s.tp1, s.tp2, s.pushed_at, o.resolved_at,"
-        " o.outcome, o.r_multiple, o.cost_r"
+        " s.lots, o.outcome, o.r_multiple, o.cost_r"
         " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
         " ORDER BY s.pushed_at, s.id"
     )
@@ -588,24 +597,24 @@ def _svg_line(pts, w=660, h=150, pad=26, base=None, fmt="{:.2f}"):
     area = f"{pad},{pad+ih} " + line + f" {pad+iw},{pad+ih}"
     out = [f'<svg class="chart" viewBox="0 0 {w} {h}" preserveAspectRatio="none">',
            '<defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1">'
-           '<stop offset="0%" stop-color="#3fb950" stop-opacity="0.34"/>'
-           '<stop offset="100%" stop-color="#3fb950" stop-opacity="0"/></linearGradient></defs>']
+           '<stop offset="0%" stop-color="#0a7f4b" stop-opacity="0.34"/>'
+           '<stop offset="100%" stop-color="#0a7f4b" stop-opacity="0"/></linearGradient></defs>']
     if base is not None and lo <= base <= hi:
         by = Y(base)
         out.append(f'<line x1="{pad}" y1="{by:.1f}" x2="{pad+iw}" y2="{by:.1f}"'
-                   ' stroke="#8b949e" stroke-width="1" stroke-dasharray="5,4"/>')
-        out.append(f'<text x="{pad+3}" y="{by-4:.1f}" fill="#8b949e" font-size="12">'
+                   ' stroke="#4a5568" stroke-width="1" stroke-dasharray="5,4"/>')
+        out.append(f'<text x="{pad+3}" y="{by-4:.1f}" fill="#4a5568" font-size="14">'
                    f'{_esc(fmt.format(base))}</text>')
     out.append(f'<polygon points="{area}" fill="url(#eqg)"/>')
-    out.append(f'<polyline points="{line}" fill="none" stroke="#3fb950"'
+    out.append(f'<polyline points="{line}" fill="none" stroke="#0a7f4b"'
                ' stroke-width="2" stroke-linejoin="round"/>')
     lx, ly = X(len(pts) - 1), Y(pts[-1][1])
-    out.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="#3fb950"/>')
-    out.append(f'<text x="{pad}" y="12" fill="#8b949e" font-size="12">'
+    out.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="#0a7f4b"/>')
+    out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="14">'
                f'{_esc(fmt.format(hi))}</text>')
-    out.append(f'<text x="{pad}" y="{h-6}" fill="#8b949e" font-size="12">'
+    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="14">'
                f'{_esc(fmt.format(lo))}</text>')
-    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#8b949e" font-size="12"'
+    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="14"'
                ' text-anchor="end">' + _esc(pts[-1][0]) + '</text>')
     out.append("</svg>")
     return "".join(out)
@@ -623,19 +632,19 @@ def _svg_bars(pts, w=660, h=140, pad=26, fmt="{:.2f}", unit=""):
     sc = (ih / 2) / (mx * 1.12)
     out = [f'<svg class="chart" viewBox="0 0 {w} {h}" preserveAspectRatio="none">',
            f'<line x1="{pad}" y1="{zero:.1f}" x2="{pad+iw}" y2="{zero:.1f}"'
-           ' stroke="#30363d" stroke-width="1"/>']
+           ' stroke="#d8dee7" stroke-width="1"/>']
     for i, (_, v) in enumerate(pts):
         cx = pad + iw * (i + 0.5) / len(pts)
         bh = abs(v) * sc
         y = zero - bh if v >= 0 else zero
-        col = "#3fb950" if v >= 0 else "#f85149"
+        col = "#0a7f4b" if v >= 0 else "#c62828"
         out.append(f'<rect x="{cx-bw/2:.1f}" y="{y:.1f}" width="{bw:.1f}"'
                    f' height="{max(bh,0.6):.1f}" fill="{col}" rx="1.5"/>')
-    out.append(f'<text x="{pad}" y="12" fill="#8b949e" font-size="12">'
+    out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="14">'
                f'±{_esc(fmt.format(mx))}{_esc(unit)}</text>')
-    out.append(f'<text x="{pad}" y="{h-6}" fill="#8b949e" font-size="12">'
+    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="14">'
                f'{_esc(pts[0][0])}</text>')
-    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#8b949e" font-size="12"'
+    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="14"'
                f' text-anchor="end">{_esc(pts[-1][0])}</text>')
     out.append("</svg>")
     return "".join(out)
@@ -652,7 +661,7 @@ def api_charts():
     rows = _query(
         "SELECT s.id, s.timeframe, s.direction, s.sig_type, s.grade, s.pushed_at,"
         " s.entry, s.sl,"
-        " o.outcome, o.r_multiple, o.resolved_at, o.cost_r"
+        " s.lots, o.outcome, o.r_multiple, o.resolved_at, o.cost_r"
         " FROM signals s LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
         " ORDER BY s.id")
     oz = _oz_per_trade(cfg)
@@ -760,28 +769,28 @@ HTML_PAGE = """<!DOCTYPE html>
              所有组件只引用令牌，不再出现魔法数字。
      ══════════════════════════════════════════════════════════════ */
   :root{
-    /* ── 表层（暗→亮 4 层，建立纵深） ── */
-    --bg:#0a0e13;      /* 页面底 */
-    --s1:#131920;      /* 一级卡面 */
-    --s2:#1a222c;      /* 内嵌 / 次级面 */
-    --s3:#222c38;      /* 日头 / 悬浮面 */
+    /* ── 表层（浅色 4 层，靠灰阶建立纵深，不用阴影堆叠） ── */
+    --bg:#f2f5f9;      /* 页面底：略灰，让白卡浮起来 */
+    --s1:#ffffff;      /* 一级卡面 */
+    --s2:#f7f9fc;      /* 内嵌 / 次级面 */
+    --s3:#eef2f7;      /* 日头 / 悬浮面 */
     /* ── 描边（2 级：定界 vs 分隔） ── */
-    --line:#28323e;
-    --line2:#1c242e;
-    /* ── 文字（3 级层次，替代原来只有 fg/mut 两级） ── */
-    --fg:#e9eff7;      /* 主：数字、标题 */
-    --fg2:#aab7c6;     /* 次：标签、说明 */
-    --fg3:#6f7d8e;     /* 弱：脚注、单位 */
-    /* ── 语义色 ── */
-    --up:#3fb950; --dn:#f85149; --warn:#e3b341; --info:#58a6ff;
-    --up-bg:#122b18; --dn-bg:#2c1414; --warn-bg:#2b2008;
+    --line:#d8dee7;
+    --line2:#e8edf3;
+    /* ── 文字（3 级层次） ── */
+    --fg:#111827;      /* 主：数字、标题 */
+    --fg2:#4a5568;     /* 次：标签、说明 */
+    --fg3:#718096;     /* 弱：脚注、单位 */
+    /* ── 语义色（浅底上要压深，否则对比度不够） ── */
+    --up:#0a7f4b; --dn:#c62828; --warn:#8a5a00; --info:#1a56db;
+    --up-bg:#e7f7ef; --dn-bg:#fdecec; --warn-bg:#fdf4e3;
     /* ── 空间（4px 基准，6 级） ── */
     --sp1:4px; --sp2:8px; --sp3:12px; --sp4:16px; --sp5:22px; --sp6:30px;
     /* ── 圆角（4 级） ── */
     --r1:6px; --r2:10px; --r3:14px; --r4:18px;
     /* ── 字号（6 级） ── */
-    --fs-xs:11.5px; --fs-sm:13px; --fs-md:14.5px; --fs-lg:16.5px;
-    --fs-xl:21px; --fs-2xl:30px;
+    --fs-xs:13px; --fs-sm:15px; --fs-md:16px; --fs-lg:19px;
+    --fs-xl:25px; --fs-2xl:36px;
     /* ── 旧变量名保留，避免 JS 内联样式失效 ── */
     --green:var(--up); --red:var(--dn); --gold:var(--warn); --blue:var(--info);
     --card:var(--s1); --border:var(--line); --mut:var(--fg2);
@@ -840,10 +849,13 @@ HTML_PAGE = """<!DOCTYPE html>
      优化前 .card / .tf / .sig / .pos / .ch-wrap 各自写一遍
      background+border+radius+padding，值还不一样 → 视觉噪音。
      现在所有面统一走 .card，变体只做最小覆盖。 */
+  /* 用 flex 而不是 auto-fit grid：grid 的 1fr 会把「只有 2 张卡」的组
+     拉成两个 900px 的大块，看着像页面坏了。flex + max-width 让卡片
+     保持同一档宽度，一行排满就够、排不满也不拉伸。 */
   .cards{
-    display:grid; grid-template-columns:repeat(auto-fit,minmax(108px,1fr));
-    gap:var(--sp2);
+    display:flex; flex-wrap:wrap; gap:var(--sp2);
   }
+  .cards > .card{ flex:1 1 140px; max-width:280px; }
   .card{
     background:var(--s1); border:1px solid var(--line); border-radius:var(--r2);
     padding:var(--sp3); min-width:0;
@@ -864,8 +876,8 @@ HTML_PAGE = """<!DOCTYPE html>
   .card.good .v{ color:var(--up); }
   .card.bad  .v{ color:var(--dn); }
   .card.warn{ background:var(--dn-bg); border-color:var(--dn); }
-  .card.warn .v{ color:#ff7b72; font-size:var(--fs-lg); }
-  .card.warn .l{ color:#ff9a92; }
+  .card.warn .v{ color:var(--dn); font-size:var(--fs-lg); }
+  .card.warn .l{ color:var(--dn); opacity:.82; }
   /* 分组卡：把一堆同权重卡片变成"有结构的三簇" */
   .cgroup{ margin-bottom:var(--sp3); }
   .cgroup:last-child{ margin-bottom:0; }
@@ -877,8 +889,8 @@ HTML_PAGE = """<!DOCTYPE html>
   /* ───── 主区：桌面左右双列 ───── */
   .main{ display:grid; gap:var(--sp5); align-items:start; }
   .col-b > section:last-child{ margin-bottom:0; }
-  @media (min-width:960px){
-    .main{ grid-template-columns:minmax(0,1.35fr) minmax(0,1fr); }
+  @media (min-width:880px){
+    .main{ grid-template-columns:minmax(0,1.15fr) minmax(0,1fr); }
   }
 
   /* ───── 周期状态卡 ───── */
@@ -986,6 +998,13 @@ HTML_PAGE = """<!DOCTYPE html>
      max-width 上限：viewBox 是 660 宽，桌面容器 1200+ 时若不设上限，
      SVG 会被拉伸到 1.8 倍，图内文字变形、比例失衡。 */
   .chart{ display:block; width:100%; max-width:720px; height:auto; margin:0 auto; }
+  /* 走势区双栏：主曲线跨两栏（曲线要宽才看得出形态），
+     逐日/按小时各占一栏并排 —— 否则三张图竖着堆一屏，要滚很久。 */
+  .chart-cols{ display:grid; gap:var(--sp4); align-items:start; }
+  @media (min-width:880px){
+    .chart-cols{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .chart-cols > .ch-wrap:first-child{ grid-column:1 / -1; }
+  }
   .ch-empty{ padding:var(--sp4) 0; text-align:center; font-size:var(--fs-sm); }
   .ch-wrap{
     background:var(--s1); border:1px solid var(--line); border-radius:var(--r3);
@@ -1045,6 +1064,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <!-- 图表：权益曲线 / 逐日 / 按小时 -->
   <section>
     <h2>📈 走势<span class="meta">只统计已结案信号</span></h2>
+    <div class="chart-cols">
     <div class="ch-wrap">
       <h3>累计真实盈亏曲线</h3>
       <div class="sub">累计<b>已实现盈亏</b>（美元），从 0 起算 —— <b>不包含入金</b>，
@@ -1066,6 +1086,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="ch-wrap">
       <h3>信号分布</h3>
       <div id="distBox" class="sub" style="margin-bottom:0"></div>
+    </div>
     </div>
   </section>
 

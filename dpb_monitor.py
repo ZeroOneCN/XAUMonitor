@@ -1121,6 +1121,123 @@ def send_alert(cfg: dict, title: str, content: str) -> bool:
     return ok
 
 
+def equity_state(cfg: dict, db_file: str) -> dict:
+    """算出「真实权益」和对应的风险调节倍数。
+
+    为什么不能再用配置里那个静态 account_equity：
+      账户补过钱（650 → 1000 → 2000），也亏掉了几百美元。用静态数字，
+      手数永远按同一个本金算 —— 亏到只剩一半时，名义 1% 的风险
+      实际上是账户的 2%。这正是两次爆仓的机制：每笔都「按 1% 下单」，
+      但分母从来没跟着账户缩水。
+
+    权益 = 累计入金 + Σ(每笔真实美元盈亏)
+    每笔美元盈亏 = net_r × 止损距离 × (手数 × 每手盎司)
+    旧信号没有 lots 列时，退回「最小手数」口径，宁可低估也不虚高。
+
+    风险倍数按回撤与连胜/连亏调节，硬夹在 [0.25, 1.5]：
+      回撤 ≥20% → ×0.5，≥10% → ×0.75
+      连亏 ≥4 笔 → ×0.5，2~3 笔 → ×0.75
+      回撤 <5% 且连赢 ≥3 笔 → ×1.25（反马丁，只在状态好时小幅加）
+    """
+    import sqlite3
+
+    contract_oz = float(cfg.get("contract_oz", 100) or 100)
+    min_lot = float(cfg.get("min_lot", 0.01) or 0.01)
+    risk_pct = float(cfg.get("risk_per_trade_pct", 1.0) or 0)
+    fallback_oz = min_lot * contract_oz
+
+    out = {
+        "ok": False, "deposits": 0.0, "realized": 0.0, "equity": 0.0,
+        "peak": 0.0, "drawdown_pct": 0.0, "streak": 0,
+        "mult": 1.0, "mult_reason": "", "closed": 0,
+    }
+    try:
+        conn = sqlite3.connect(db_file)
+    except sqlite3.Error as e:
+        out["reason"] = f"打不开数据库: {e}"
+        return out
+
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            deposits = float(
+                conn.execute("SELECT COALESCE(SUM(amount),0) AS a FROM capital_flows")
+                .fetchone()["a"] or 0
+            )
+        except sqlite3.Error:
+            deposits = 0.0   # 老库没有台账表
+
+        rows = conn.execute(
+            "SELECT s.entry, s.sl, s.lots, o.r_multiple AS r"
+            " FROM signals s JOIN signal_outcomes o ON o.signal_id = s.id"
+            " WHERE o.resolved_at IS NOT NULL AND o.r_multiple IS NOT NULL"
+            " ORDER BY o.resolved_at"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # 逐笔累加，同时记录权益高点
+    eq = deposits
+    peak = deposits
+    streaks = []          # 1=赢, -1=亏
+    realized = 0.0
+    for x in rows:
+        try:
+            r = float(x["r"])
+            dist = abs(float(x["entry"]) - float(x["sl"]))
+        except (TypeError, ValueError):
+            continue
+        if dist <= 0:
+            continue
+        lots = x["lots"]
+        try:
+            q = float(lots) if lots is not None else 0.0
+        except (TypeError, ValueError):
+            q = 0.0
+        per_oz = q * contract_oz if q > 0 else fallback_oz
+        usd = r * dist * per_oz
+        realized += usd
+        eq += usd
+        if eq > peak:
+            peak = eq
+        streaks.append(1 if r > 0 else -1)
+
+    # 连续同向的尾部长
+    streak = 0
+    for s in reversed(streaks):
+        if streak == 0 or s == (1 if streak > 0 else -1):
+            streak += s
+        else:
+            break
+
+    dd = (peak - eq) / peak if peak > 0 else 0.0
+    mult, reasons = 1.0, []
+    if dd >= 0.20:
+        mult *= 0.5
+        reasons.append(f"回撤{dd*100:.0f}%")
+    elif dd >= 0.10:
+        mult *= 0.75
+        reasons.append(f"回撤{dd*100:.0f}%")
+    if streak <= -4:
+        mult *= 0.5
+        reasons.append(f"连亏{-streak}笔")
+    elif streak <= -2:
+        mult *= 0.75
+        reasons.append(f"连亏{-streak}笔")
+    if dd < 0.05 and streak >= 3:
+        mult *= 1.25
+        reasons.append(f"连赢{streak}笔")
+    mult = max(0.25, min(1.5, mult))
+
+    out.update({
+        "ok": eq > 0, "deposits": deposits, "realized": realized, "equity": eq,
+        "peak": peak, "drawdown_pct": dd * 100, "streak": streak,
+        "mult": mult, "mult_reason": "+".join(reasons) or "正常",
+        "closed": len(streaks),
+    })
+    return out
+
+
 def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
     """按「账户资金 × 单笔风险%」与止损距离计算建议手数。
 
@@ -1136,17 +1253,33 @@ def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
     当按风险%算出的手数低于最小手数时，标记 undersized 并在推送里明说
     「止损过宽 / 账户偏小」，而不是让用户稀里糊涂下重仓。
     """
-    equity = float(cfg.get("account_equity", 1000) or 0)
     risk_pct = float(cfg.get("risk_per_trade_pct", 1.0) or 0)
     contract_oz = float(cfg.get("contract_oz", 100) or 0)
     min_lot = float(cfg.get("min_lot", 0.01) or 0)
     max_lot = float(cfg.get("max_lot", 10.0) or 0)
 
+    # 本金动态化：默认用「入金台账 + 已实现盈亏」算出的真实权益，
+    # 而不是配置里那个静态 account_equity —— 账户亏薄了手数要跟着缩，
+    # 赚厚了才放大。dynamic_equity=false 可退回旧行为。
+    es: dict = {}
+    if cfg.get("dynamic_equity", True):
+        db_path = (
+            cfg.get("db_path") or cfg.get("db_file")
+            or cfg.get("signals_db") or "signals.db"
+        )
+        try:
+            es = equity_state(cfg, db_path)
+        except Exception as e:      # 任何异常都不该让开仓计算崩掉
+            log.warning("[风控] 权益计算失败，退回静态本金: %s", e)
+            es = {}
+    equity = float(es.get("equity") or cfg.get("account_equity", 1000) or 0)
+    mult = float(es.get("mult") or 1.0)
+
     sl_dist = abs(entry - sl)
     if sl_dist <= 0 or contract_oz <= 0 or equity <= 0:
         return {"ok": False, "reason": "参数无效"}
 
-    risk_amount = equity * risk_pct / 100.0
+    risk_amount = equity * risk_pct / 100.0 * mult
     raw_lots = risk_amount / (sl_dist * contract_oz)
 
     # 注意：必须用「未取整」的手数判断是否低于最小手数，
@@ -1180,6 +1313,12 @@ def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
         "leverage": leverage,
         "capped": capped,
         "point_value": contract_oz,
+        # 动态本金相关：让推送里能写清「这笔按什么本金、什么倍数算的」
+        "mult": mult,
+        "mult_reason": es.get("mult_reason", ""),
+        "dynamic": bool(es),
+        "drawdown_pct": es.get("drawdown_pct", 0.0),
+        "streak": es.get("streak", 0),
     }
 
 
