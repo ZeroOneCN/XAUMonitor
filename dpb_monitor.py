@@ -1173,6 +1173,17 @@ def equity_state(cfg: dict, db_file: str) -> dict:
             " WHERE o.resolved_at IS NOT NULL AND o.r_multiple IS NOT NULL"
             " ORDER BY o.resolved_at"
         ).fetchall()
+
+        # 行情调节用的 ATR 样本：取最近 120 条信号的 ATR 与最新一条
+        try:
+            atrs = [
+                float(r["a"]) for r in conn.execute(
+                    "SELECT atr AS a FROM signals WHERE atr IS NOT NULL"
+                    " ORDER BY id DESC LIMIT 120").fetchall()
+                if r["a"]
+            ]
+        except sqlite3.Error:
+            atrs = []
     finally:
         conn.close()
 
@@ -1227,7 +1238,32 @@ def equity_state(cfg: dict, db_file: str) -> dict:
     if dd < 0.05 and streak >= 3:
         mult *= 1.25
         reasons.append(f"连赢{streak}笔")
-    mult = max(0.25, min(1.5, mult))
+    # ── 行情调节：波动越大越缩，越平静越放 ──
+    # 止损宽度本来就跟着 ATR 走，所以 dollar 风险恒定；这里调的是
+    # 「愿意承担多少」——剧烈行情下同样的结构更容易假突破被扫。
+    vol_ratio = 0.0
+    if len(atrs) >= 20:
+        latest_atr = atrs[0]
+        med = sorted(atrs)[len(atrs) // 2]
+        if med > 0:
+            vol_ratio = latest_atr / med
+            if vol_ratio >= 1.30:
+                mult *= 0.8
+                reasons.append(f"波动{vol_ratio:.1f}倍")
+            elif vol_ratio <= 0.70:
+                mult *= 1.15
+                reasons.append(f"波动{vol_ratio:.1f}倍")
+
+    # 硬上限：任何调节都不能突破 risk_ceiling_pct / risk_per_trade_pct
+    # 否则「倍数」会变成放大仓位的漏洞
+    base_pct = float(cfg.get("risk_per_trade_pct", 1.0) or 0)
+    ceil_pct = float(cfg.get("risk_ceiling_pct", 0) or 0)
+    if base_pct > 0 and ceil_pct > 0:
+        cap = ceil_pct / base_pct
+        if mult > cap:
+            mult = cap
+            reasons.append(f"封顶{ceil_pct:g}%")
+    mult = max(0.25, round(mult, 3))
 
     out.update({
         "ok": eq > 0, "deposits": deposits, "realized": realized, "equity": eq,
@@ -1238,7 +1274,8 @@ def equity_state(cfg: dict, db_file: str) -> dict:
     return out
 
 
-def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
+def calc_position_size(entry: float, sl: float, cfg: dict,
+                       tf: str = None, direction: int = None) -> dict:
     """按「账户资金 × 单笔风险%」与止损距离计算建议手数。
 
     黄金 1 标准手 = contract_oz 盎司（默认 100），价格每变动 $1
@@ -1262,11 +1299,11 @@ def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
     # 而不是配置里那个静态 account_equity —— 账户亏薄了手数要跟着缩，
     # 赚厚了才放大。dynamic_equity=false 可退回旧行为。
     es: dict = {}
+    db_path = (
+        cfg.get("db_path") or cfg.get("db_file")
+        or cfg.get("signals_db") or "signals.db"
+    )
     if cfg.get("dynamic_equity", True):
-        db_path = (
-            cfg.get("db_path") or cfg.get("db_file")
-            or cfg.get("signals_db") or "signals.db"
-        )
         try:
             es = equity_state(cfg, db_path)
         except Exception as e:      # 任何异常都不该让开仓计算崩掉
@@ -1274,6 +1311,29 @@ def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
             es = {}
     equity = float(es.get("equity") or cfg.get("account_equity", 1000) or 0)
     mult = float(es.get("mult") or 1.0)
+
+    # 灵活加仓：同周期同方向已有未结案信号时，这笔视为「加仓」，
+    # 降到 add_on_scale（默认 0.6）倍 —— 允许顺势加，但不允许
+    # 把同时持仓的风险叠加成两倍。没有持仓时走正常仓位。
+    add_on = False
+    if cfg.get("allow_add_on", True) and tf and direction:
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(db_path)
+            _c.row_factory = _sq.Row
+            _open = _c.execute(
+                "SELECT COUNT(*) AS c FROM signals s"
+                " LEFT JOIN signal_outcomes o ON o.signal_id = s.id"
+                " WHERE s.timeframe = ? AND s.direction = ?"
+                "   AND o.resolved_at IS NULL",
+                (str(tf), int(direction)),
+            ).fetchone()["c"]
+            _c.close()
+            if _open and int(_open) > 0:
+                add_on = True
+                mult *= float(cfg.get("add_on_scale", 0.6) or 0.6)
+        except Exception as e:
+            log.debug("[仓位] 加仓检测失败，按正常仓位: %s", e)
 
     sl_dist = abs(entry - sl)
     if sl_dist <= 0 or contract_oz <= 0 or equity <= 0:
@@ -1319,6 +1379,7 @@ def calc_position_size(entry: float, sl: float, cfg: dict) -> dict:
         "dynamic": bool(es),
         "drawdown_pct": es.get("drawdown_pct", 0.0),
         "streak": es.get("streak", 0),
+        "add_on": add_on,
     }
 
 
@@ -1331,7 +1392,10 @@ def calc_sl_tp(sig: int, row: pd.Series, cfg: dict, tf: str) -> tuple:
     sl_cushion = cfg.get("sl_cushion", 0.3)
     pullback_extreme = row.get("signal_pullback_extreme", np.nan)
     sig_type = row.get("signal_type", "")
-    bo_sl_atr = cfg.get("breakout_sl_atr", 1.5)
+    # 大级别放宽止损：4h 的结构噪音是 15m 的数倍，同一个 1.5×ATR
+    # 在 4h 上等于把止损压在正常回调范围内，被扫是结构性的不是运气。
+    _sl_by_tf = cfg.get("sl_atr_by_tf") or {}
+    bo_sl_atr = float(_sl_by_tf.get(tf, cfg.get("breakout_sl_atr", 1.5)))
     min_sl_atr = cfg.get("min_sl_atr", 0.3)   # 止损最近距离（ATR倍数）
     max_sl_atr = cfg.get("max_sl_atr", 4.0)   # 止损最远距离，限制单笔敞口
     fallback_sl_atr = cfg.get("fallback_sl_atr", 1.5)  # 结构失效时的兜底止损
@@ -1412,7 +1476,7 @@ def format_signal_msg(tf: str, signal: int, row: pd.Series, cfg: dict, resonance
     resonance = bool(resonance_tfs) and len(resonance_tfs) >= 2
 
     # 做单策略：仓位管理
-    ps = calc_position_size(entry, sl, cfg) if cfg.get("use_position_sizing", True) else None
+    ps = calc_position_size(entry, sl, cfg, tf=tf, direction=sig) if cfg.get("use_position_sizing", True) else None
     lot_txt = f" {ps['lots']:.2f}手" if ps and ps.get("ok") else ""
 
     # 标题：手机通知预览里就能看到 方向/周期/价格/手数/止损止盈

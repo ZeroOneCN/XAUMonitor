@@ -603,18 +603,18 @@ def _svg_line(pts, w=660, h=150, pad=26, base=None, fmt="{:.2f}"):
         by = Y(base)
         out.append(f'<line x1="{pad}" y1="{by:.1f}" x2="{pad+iw}" y2="{by:.1f}"'
                    ' stroke="#4a5568" stroke-width="1" stroke-dasharray="5,4"/>')
-        out.append(f'<text x="{pad+3}" y="{by-4:.1f}" fill="#4a5568" font-size="14">'
+        out.append(f'<text x="{pad+3}" y="{by-4:.1f}" fill="#4a5568" font-size="10">'
                    f'{_esc(fmt.format(base))}</text>')
     out.append(f'<polygon points="{area}" fill="url(#eqg)"/>')
     out.append(f'<polyline points="{line}" fill="none" stroke="#0a7f4b"'
                ' stroke-width="2" stroke-linejoin="round"/>')
     lx, ly = X(len(pts) - 1), Y(pts[-1][1])
     out.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="#0a7f4b"/>')
-    out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="14">'
+    out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="10">'
                f'{_esc(fmt.format(hi))}</text>')
-    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="14">'
+    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="10">'
                f'{_esc(fmt.format(lo))}</text>')
-    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="14"'
+    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="10"'
                ' text-anchor="end">' + _esc(pts[-1][0]) + '</text>')
     out.append("</svg>")
     return "".join(out)
@@ -640,11 +640,11 @@ def _svg_bars(pts, w=660, h=140, pad=26, fmt="{:.2f}", unit=""):
         col = "#0a7f4b" if v >= 0 else "#c62828"
         out.append(f'<rect x="{cx-bw/2:.1f}" y="{y:.1f}" width="{bw:.1f}"'
                    f' height="{max(bh,0.6):.1f}" fill="{col}" rx="1.5"/>')
-    out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="14">'
+    out.append(f'<text x="{pad}" y="12" fill="#4a5568" font-size="10">'
                f'±{_esc(fmt.format(mx))}{_esc(unit)}</text>')
-    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="14">'
+    out.append(f'<text x="{pad}" y="{h-6}" fill="#4a5568" font-size="10">'
                f'{_esc(pts[0][0])}</text>')
-    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="14"'
+    out.append(f'<text x="{w-pad}" y="{h-6}" fill="#4a5568" font-size="10"'
                f' text-anchor="end">{_esc(pts[-1][0])}</text>')
     out.append("</svg>")
     return "".join(out)
@@ -1055,75 +1055,147 @@ HTML_PAGE = """<!DOCTYPE html>
     h2{ flex-wrap:wrap; }
     h2 .meta{ margin-left:0; flex-basis:100%; }
   }
+
+  /* ══════ 标签页 ══════ */
+  .tabs{ display:flex; flex-wrap:wrap; gap:var(--sp1);
+         margin:var(--sp3) 0 var(--sp4); border-bottom:1px solid var(--line); }
+  .tab{ appearance:none; background:none; border:0; border-bottom:2px solid transparent;
+         margin-bottom:-1px; padding:var(--sp2) var(--sp4); font:inherit;
+         font-size:var(--fs-sm); font-weight:700; color:var(--fg3); cursor:pointer; }
+  .tab:hover{ color:var(--fg2); }
+  .tab.on{ color:var(--fg); border-bottom-color:var(--info); }
+
+  /* ══════ 卡片：标签与数值并排（上下堆叠太浪费竖向空间） ══════ */
+  .cards > .card{
+    flex:1 1 168px; max-width:252px; min-width:0;
+    display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between;
+    gap:var(--sp1) var(--sp2); padding:var(--sp2) var(--sp3);
+  }
+  .card .l{ order:-1; margin-top:0; font-size:var(--fs-sm); letter-spacing:0; }
+  .card .v{ font-size:var(--fs-lg); letter-spacing:-.2px; }
+
+  /* ══════ 曲线铺满卡片内容区 ══════ */
+  .chart{ max-width:none; }
+
+  /* ══════ 深色数据块：浅底页面上保留黑色对比区 ══════ */
+  .dayhead, .pos, .row-sig, .sig, .tf{
+    --fg:#e9eff7; --fg2:#aab7c6; --fg3:#8792a1;
+    --line:#2a3340; --line2:#1f2733; --s2:#1a212b;
+    background:#12171f; color:var(--fg); border-color:var(--line);
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>⚡ XAUMonitor · DPB 黄金信号</h1>
+    <h1>XAUMonitor · DPB 黄金信号</h1>
     <div class="sub" id="sub" style="margin:0">加载中…</div>
   </header>
 
   <div id="cards"></div>
-  <div id="stats" class="sub" style="margin:var(--sp3) 0 var(--sp5)"></div>
 
-  <!-- 资金与盈亏（含持仓中实时浮动） -->
-  <section>
-    <h2>💰 资金与盈亏<span class="meta" id="eqSrc"></span></h2>
-    <div id="eqCards"></div>
-    <div id="posWrap" style="margin-top:var(--sp3)"></div>
-  </section>
+  <nav class="tabs" id="tabs">
+    <button class="tab on" type="button" data-pane="pane-fund">资金</button>
+    <button class="tab" type="button" data-pane="pane-trend">走势</button>
+    <button class="tab" type="button" data-pane="pane-detail">明细</button>
+    <button class="tab" type="button" data-pane="pane-help">说明</button>
+  </nav>
 
-  <!-- 图表：权益曲线 / 逐日 / 按小时 -->
-  <section>
-    <h2>📈 走势<span class="meta">只统计已结案信号</span></h2>
-    <div class="chart-cols">
-    <div class="ch-wrap">
-      <h3>累计真实盈亏曲线</h3>
-      <div class="sub">累计<b>已实现盈亏</b>（美元），从 0 起算 —— <b>不包含入金</b>，
-        所以补保证金不会让曲线变好看。零轴虚线 = 不赚不亏。
-        当前真实盈亏见上方「账户」卡。浮动盈亏不计入曲线。</div>
-      <div id="eqChart"></div>
-    </div>
-    <div class="ch-wrap">
-      <h3>逐日盈亏</h3>
-      <div class="sub">每根柱子 = 该日已结案信号的美元合计。<span class="up">绿盈</span> / <span class="dn">红亏</span>。</div>
-      <div id="dayChart"></div>
-    </div>
-    <div class="ch-wrap">
-      <h3>按小时期望值</h3>
-      <div class="sub">每根柱子 = 该小时全部已结案信号的<b>平均净 R</b>（样本 &lt;2 笔不画）。
-        用于判断要不要开时段过滤 <code>block_hours</code> —— 长期为负才值得开，现在默认关。</div>
-      <div id="hourChart"></div>
-    </div>
-    <div class="ch-wrap">
-      <h3>信号分布</h3>
-      <div id="distBox" class="sub" style="margin-bottom:0"></div>
-    </div>
-    </div>
-  </section>
-
-  <div class="main">
-    <!-- 左（视觉第一优先）：按日分区 + 分页 -->
+  <div class="pane" id="pane-fund">
     <section>
-      <h2>📅 按日分区 · 信号与盈亏<span class="meta" id="dailyMeta"></span></h2>
-      <div id="dailyWrap" class="sub">加载中…</div>
-      <div class="pager" id="pager"></div>
+      <h2>资金与盈亏<span class="meta" id="eqSrc"></span></h2>
+      <div id="eqCards"></div>
+      <div id="posWrap" style="margin-top:var(--sp3)"></div>
+      <div class="ch-wrap" style="margin-top:var(--sp5)">
+        <h3>累计真实盈亏曲线</h3>
+        <div id="eqChart"></div>
+      </div>
     </section>
+  </div>
 
-    <!-- 右：胜率 + 实时状态 -->
-    <div class="col-b">
-      <section>
-        <h2>📊 结果追踪 · 胜率</h2>
-        <div id="outCards"></div>
-        <div id="outDetail" class="sub" style="margin:var(--sp3) 0 0"></div>
-      </section>
+  <div class="pane" id="pane-trend" hidden>
+    <section>
+      <h2>走势<span class="meta">只统计已结案信号</span></h2>
+      <div class="chart-cols">
+        <div class="ch-wrap">
+          <h3>逐日盈亏</h3>
+          <div id="dayChart"></div>
+        </div>
+        <div class="ch-wrap">
+          <h3>按小时期望值</h3>
+          <div id="hourChart"></div>
+        </div>
+        <div class="ch-wrap">
+          <h3>信号分布</h3>
+          <div id="distBox" class="sub" style="margin-bottom:0"></div>
+        </div>
+      </div>
+    </section>
+  </div>
 
+  <div class="pane" id="pane-detail" hidden>
+    <div class="main">
       <section>
-        <h2>📈 各周期实时状态</h2>
-        <div class="tf-grid" id="tfGrid"></div>
+        <h2>按日分区<span class="meta" id="dailyMeta"></span></h2>
+        <div id="dailyWrap" class="sub">加载中…</div>
+        <div class="pager" id="pager"></div>
       </section>
+      <div class="col-b">
+        <section>
+          <h2>结果追踪 · 胜率</h2>
+          <div id="outCards"></div>
+          <div id="outDetail" class="sub" style="margin:var(--sp3) 0 0"></div>
+        </section>
+        <section>
+          <h2>各周期实时状态</h2>
+          <div class="tf-grid" id="tfGrid"></div>
+        </section>
+      </div>
     </div>
+  </div>
+
+  <div class="pane" id="pane-help" hidden>
+    <section>
+      <h2>说明</h2>
+
+      <div class="ch-wrap">
+        <h3>页面在做什么</h3>
+        <div class="sub" style="margin-bottom:0">
+          监控黄金（XAU/USD）15m / 1h / 4h 三个周期的「二次回踩」与「突破」信号，
+          命中后推送 Telegram。每条信号在库里追踪到止损、止盈或超时结案。
+        </div>
+      </div>
+
+      <div class="ch-wrap">
+        <h3>手数怎么算</h3>
+        <div class="sub" style="margin-bottom:0">
+          风险金额 = 真实权益 × 单笔风险% × 行情调节倍数；手数 = 风险金额 ÷（止损距离 × 100）。
+          真实权益 = 累计入金 + 已实现盈亏，所以账户亏薄了手数会自动缩。
+          低于 0.01 手（最小手数）时按 0.01 手下单，并在推送里标注「止损过宽」。
+        </div>
+      </div>
+
+      <div class="ch-wrap">
+        <h3>权益与曲线为什么不是同一个数</h3>
+        <div class="sub" style="margin-bottom:0">
+          卡片里的「当前权益」含持仓中的浮动盈亏；曲线只累计<b>已实现</b>盈亏，从 0 起算，
+          所以<b>补保证金不会让曲线变好看</b>。
+        </div>
+      </div>
+
+      <div class="ch-wrap">
+        <h3>数据来源</h3>
+        <div class="sub" style="margin-bottom:0">
+          signals.db（信号与结案）+ dpb_status.json（实时状态）+ paxg_stream.db（实时金价）。
+          页面每 15 秒自动刷新，零 API 消耗。
+        </div>
+      </div>
+
+      <div class="ch-wrap">
+        <h3>当前配置</h3>
+        <div id="stats" class="sub" style="margin-bottom:0">加载中…</div>
+      </div>
+    </section>
   </div>
 
   <div class="foot">
@@ -1133,6 +1205,21 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
+// 标签页切换：避免所有区块堆在一屏
+function showPane(id){
+  document.querySelectorAll('.tab').forEach((x)=>{ x.classList.toggle('on', x.dataset.pane === id); });
+  document.querySelectorAll('.pane').forEach((p)=>{ p.hidden = (p.id !== id); });
+}
+document.querySelectorAll('.tab').forEach((b) => {
+  b.addEventListener('click', () => {
+    showPane(b.dataset.pane);
+    history.replaceState(null,'','#'+b.dataset.pane);   // 可直接收藏/分享某一页
+  });
+});
+// 打开时按 hash 定位，刷新后不会跳回第一页
+if (location.hash) { const id = location.hash.slice(1);
+  if (document.getElementById(id) && document.getElementById(id).classList.contains('pane')) showPane(id); }
+
 const E = (t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;};
 const fmtN = v => (v==null?'-':v);
 // 每日分区：分页状态必须放在 load() 外面，否则每次自动刷新都会跳回第 1 页
